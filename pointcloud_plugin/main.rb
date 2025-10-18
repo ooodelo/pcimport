@@ -71,7 +71,7 @@ module PointCloudPlugin
     submenu = extensions_menu.add_submenu('Point Cloud Importer')
     submenu.add_item('Import Point Cloud...') { start_import }
     submenu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
-    submenu.add_item('Вставить облако') { activate_tool }
+    submenu.add_item('Activate Point Cloud Tool') { activate_tool }
     @menu_created = true
     log('Menu items registered')
   end
@@ -80,11 +80,11 @@ module PointCloudPlugin
     return unless defined?(::UI)
     return if @toolbar&.valid?
 
-    command = ::UI::Command.new('Вставить облако') do
+    command = ::UI::Command.new('Import Point Cloud...') do
       start_import
     end
-    command.tooltip = 'Импорт и вставка облака точек'
-    command.status_bar_text = 'Открыть файл облака точек и активировать инструмент просмотра'
+    command.tooltip = 'Import and activate the point cloud tool'
+    command.status_bar_text = 'Open a point cloud file and activate the viewer tool'
 
     toolbar = ::UI::Toolbar.new('Point Cloud Importer')
     toolbar.add_item(command)
