@@ -37,6 +37,7 @@ module PointCloudPlugin
       def draw(view)
         gather_chunks(view)
         points_by_color = Hash.new { |hash, key| hash[key] = [] }
+        color_lookup = {}
 
         @chunk_usage.each do |key|
           entry = @active_chunks[key]
@@ -45,7 +46,9 @@ module PointCloudPlugin
           chunk = entry[:chunk]
           chunk.size.times do |index|
             point = chunk.point_at(index)
-            points_by_color[group_key_for(point[:color])] << point[:position]
+            key, color_value = color_bucket_for(point)
+            color_lookup[key] ||= color_value
+            points_by_color[key] << point[:position]
           end
         end
 
@@ -57,14 +60,7 @@ module PointCloudPlugin
                           end
 
           points_by_color.each do |color_key, positions|
-            color = if color_key == :default
-                      default_color
-                    elsif defined?(Sketchup::Color)
-                      Sketchup::Color.new(*color_key)
-                    else
-                      r, g, b = color_key
-                      format('#%02X%02X%02X', r, g, b)
-                    end
+            color = color_for(color_key, color_lookup[color_key], default_color)
 
             positions.each_slice(max_points_per_batch) do |batch|
               sketchup_points = convert_positions_to_points(batch)
@@ -105,15 +101,50 @@ module PointCloudPlugin
         end
       end
 
-      def group_key_for(color)
-        return :default unless color.is_a?(Array) && color.length >= 3
+      def color_bucket_for(point)
+        color = point[:color]
 
-        [color[0], color[1], color[2]].map(&:to_i).freeze
+        if color.is_a?(Array) && color.length >= 3
+          quantized = color.first(3).map { |component| quantize_color_component(component) }
+          [[:rgb, *quantized], quantized]
+        elsif point.key?(:intensity) && !point[:intensity].nil?
+          grayscale = quantize_intensity(point[:intensity])
+          [[:intensity, grayscale], [grayscale, grayscale, grayscale]]
+        else
+          [:default, nil]
+        end
+      end
+
+      def quantize_color_component(value)
+        component = value.to_f
+        component *= 255.0 if component <= 1.0
+        step = 256 / 32
+        quantized = (component.clamp(0.0, 255.0) / step).floor * step
+        quantized.to_i
+      end
+
+      def quantize_intensity(value)
+        intensity = value.to_f
+        intensity *= 255.0 if intensity <= 1.0
+        quantize_color_component(intensity)
+      end
+
+      def color_for(key, rgb_values, default_color)
+        return default_color if key == :default || rgb_values.nil?
+
+        r, g, b = rgb_values
+        if defined?(Sketchup::Color)
+          Sketchup::Color.new(r, g, b)
+        else
+          format('#%02X%02X%02X', r, g, b)
+        end
       end
 
       def gather_chunks(view)
         frustum = current_frustum(view)
         visible_keys = Set.new
+        budget = @settings[:budget].to_i
+        points_accumulated = 0
 
         manager.each_cloud do |cloud|
           cloud.prefetcher.prefetch_for_view(frustum, budget: @settings[:budget])
@@ -122,22 +153,40 @@ module PointCloudPlugin
 
             next unless chunk_visible?(chunk, frustum)
 
+            break if budget.positive? && points_accumulated >= budget
+
+            chunk_points = chunk.size
+            if budget.positive? && points_accumulated.positive? && points_accumulated + chunk_points > budget
+              next
+            end
+
             store_active_chunk(key, chunk, cloud.pipeline.chunk_store)
             visible_keys << key
+            points_accumulated += chunk_points
             hud.update("cloud_#{cloud.id}_points" => chunk.size)
           end
+
+          break if budget.positive? && points_accumulated >= budget
         end
 
         @active_chunks.each do |key, entry|
           next if visible_keys.include?(key)
 
-          if chunk_visible?(entry[:chunk], frustum)
-            touch_chunk(key)
-            visible_keys << key
+          next unless chunk_visible?(entry[:chunk], frustum)
+
+          break if budget.positive? && points_accumulated >= budget
+
+          chunk_points = entry[:chunk].size
+          if budget.positive? && points_accumulated.positive? && points_accumulated + chunk_points > budget
+            next
           end
+
+          touch_chunk(key)
+          visible_keys << key
+          points_accumulated += chunk_points
         end
 
-        evict_stale_chunks(visible_keys)
+        evict_stale_chunks(visible_keys, budget)
       end
 
       def current_frustum(view)
@@ -188,13 +237,18 @@ module PointCloudPlugin
         @chunk_usage.unshift(key)
       end
 
-      def evict_stale_chunks(visible_keys)
+      def evict_stale_chunks(visible_keys, budget)
         (@active_chunks.keys - visible_keys.to_a).each do |stale_key|
           evict_chunk(stale_key)
         end
 
-        while @chunk_usage.size > @settings[:budget]
-          evict_chunk(@chunk_usage.last)
+        return unless budget.positive?
+
+        points = total_points_for(@chunk_usage)
+        while points > budget && @chunk_usage.any?
+          key = @chunk_usage.last
+          points -= chunk_size_for(key)
+          evict_chunk(key)
         end
       end
 
@@ -237,7 +291,15 @@ module PointCloudPlugin
         return unless view.respond_to?(:draw_points)
 
         snap_points = convert_positions_to_points([@snap_target[:position]])
-        view.draw_points(snap_points, @settings[:point_size] * 2) unless snap_points.empty?
+        return if snap_points.empty?
+
+        color = if defined?(Sketchup::Color)
+                  Sketchup::Color.new(255, 0, 0)
+                else
+                  '#FF0000'
+                end
+
+        view.draw_points(snap_points, @settings[:point_size] * 2, 2, color)
       end
 
       def max_points_per_batch
@@ -262,6 +324,15 @@ module PointCloudPlugin
         return if magnitude.zero?
 
         vector.map { |component| component / magnitude }
+      end
+
+      def total_points_for(keys)
+        keys.sum { |key| chunk_size_for(key) }
+      end
+
+      def chunk_size_for(key)
+        entry = @active_chunks[key]
+        entry ? entry[:chunk].size : 0
       end
     end
   end
