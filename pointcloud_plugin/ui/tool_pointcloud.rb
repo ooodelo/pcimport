@@ -57,9 +57,6 @@ module PointCloudPlugin
                           end
 
           points_by_color.each do |color_key, positions|
-            sketchup_points = convert_positions_to_points(positions)
-            next if sketchup_points.empty?
-
             color = if color_key == :default
                       default_color
                     elsif defined?(Sketchup::Color)
@@ -69,7 +66,12 @@ module PointCloudPlugin
                       format('#%02X%02X%02X', r, g, b)
                     end
 
-            view.draw_points(sketchup_points, @settings[:point_size], 1, color)
+            positions.each_slice(max_points_per_batch) do |batch|
+              sketchup_points = convert_positions_to_points(batch)
+              next if sketchup_points.empty?
+
+              view.draw_points(sketchup_points, @settings[:point_size], 1, color)
+            end
           end
           draw_snap(view)
           hud.draw(view)
@@ -206,7 +208,7 @@ module PointCloudPlugin
       end
 
       def update_snap_target(view, x, y)
-        return unless view.respond_to?(:pick_helper)
+        return unless view.respond_to?(:pickray)
 
         samples = []
         manager.each_cloud do |cloud|
@@ -214,22 +216,52 @@ module PointCloudPlugin
         end
         return if samples.empty?
 
-        pick_helper = view.pick_helper
-        pick_helper.do_pick(x, y)
-        picked = pick_helper.best_picked
-        return unless picked&.respond_to?(:position)
+        origin, direction = view.pickray(x, y)
+        origin = to_coordinates(origin)
+        direction = normalize_vector(to_coordinates(direction))
+        return unless origin && direction
 
-        target_point = picked.position.to_a
         knn = Core::Spatial::Knn.new(samples)
-        nearest = knn.nearest(target_point, 1).first
-        @snap_target = nearest&.first
+        nearest = knn.nearest_to_ray(origin, direction, 1).first
+
+        radius = @settings[:snap_radius].to_f
+        @snap_target = if nearest && nearest[1] <= radius**2
+                         nearest.first
+                       else
+                         nil
+                       end
       end
 
       def draw_snap(view)
         return unless @snap_target
         return unless view.respond_to?(:draw_points)
 
-        view.draw_points([@snap_target[:position]], @settings[:point_size] * 2)
+        snap_points = convert_positions_to_points([@snap_target[:position]])
+        view.draw_points(snap_points, @settings[:point_size] * 2) unless snap_points.empty?
+      end
+
+      def max_points_per_batch
+        100_000
+      end
+
+      def to_coordinates(value)
+        if value.respond_to?(:to_a)
+          coords = value.to_a
+          return coords[0, 3] if coords.length >= 3
+        elsif value.is_a?(Array)
+          return value[0, 3]
+        end
+
+        nil
+      end
+
+      def normalize_vector(vector)
+        return unless vector
+
+        magnitude = Math.sqrt(vector.sum { |component| component * component })
+        return if magnitude.zero?
+
+        vector.map { |component| component / magnitude }
       end
     end
   end
