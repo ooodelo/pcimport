@@ -18,12 +18,6 @@ module PointCloudPlugin
     rescue StandardError
       nil
     end
-
-    def log(message)
-      PointCloudPlugin.log(message)
-    end
-
-    module_function :log
   end
 end
 
