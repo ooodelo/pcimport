@@ -7,6 +7,7 @@ module PointCloudPlugin
     # Thread safe queue that marshals work to SketchUp's main thread via timers.
     class MainThreadQueue
       MAX_JOBS_PER_TICK = 50
+      QUEUE_WARNING_THRESHOLD = 100
 
       def initialize(interval: 0.1)
         @queue = Queue.new
@@ -20,9 +21,18 @@ module PointCloudPlugin
       end
 
       def drain
+        backlog = @queue.size
+        if backlog > QUEUE_WARNING_THRESHOLD && PointCloudPlugin.respond_to?(:log)
+          PointCloudPlugin.log("MainThreadQueue backlog: #{backlog} jobs pending")
+        end
+
         processed = 0
         while processed < MAX_JOBS_PER_TICK
-          job = @queue.pop(true) rescue nil
+          job = begin
+            @queue.pop(true)
+          rescue ThreadError
+            nil
+          end
           break unless job
 
           job.call
