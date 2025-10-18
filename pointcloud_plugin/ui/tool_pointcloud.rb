@@ -23,6 +23,8 @@ module PointCloudPlugin
         @active_chunks = {}
         @chunk_usage = []
         @snap_target = nil
+        @frame_times = []
+        @last_draw_time = nil
         hook_settings
       end
 
@@ -35,6 +37,7 @@ module PointCloudPlugin
       end
 
       def draw(view)
+        update_fps
         gather_chunks(view)
         points_by_color = Hash.new { |hash, key| hash[key] = [] }
         color_lookup = {}
@@ -85,6 +88,24 @@ module PointCloudPlugin
         settings_dialog.on_change do |new_settings|
           @settings = new_settings
         end
+      end
+
+      def update_fps
+        clock = Process.const_defined?(:CLOCK_MONOTONIC) ? Process::CLOCK_MONOTONIC : :monotonic
+        now = Process.clock_gettime(clock)
+        if @last_draw_time
+          frame_time = now - @last_draw_time
+          @frame_times << frame_time
+          @frame_times.shift while @frame_times.length > 30
+
+          average_frame_time = @frame_times.sum / @frame_times.length
+          fps = average_frame_time.positive? ? (1.0 / average_frame_time) : 0.0
+          hud.update('fps' => format('%.1f', fps))
+        end
+        @last_draw_time = now
+      rescue Errno::EINVAL
+        # Fallback for systems where CLOCK_MONOTONIC is unavailable
+        @last_draw_time = nil
       end
 
       def convert_positions_to_points(positions)
