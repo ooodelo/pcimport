@@ -38,10 +38,18 @@ module PointCloudPlugin
         reader.each_batch do |batch|
           total_points += batch.size
           chunk = pack(batch)
+          first_chunk = (@chunk_index.zero?)
           key = next_key
           pipeline.submit_chunk(key, chunk)
           @progress = total_points
-          queue.push { notify_progress(key, chunk) }
+          queue.push do
+            notify_progress(
+              key,
+              chunk,
+              total_points: total_points,
+              first_chunk: first_chunk
+            )
+          end
         end
 
         queue.push { @on_complete&.call(self) }
@@ -49,10 +57,14 @@ module PointCloudPlugin
         queue.push { warn("Import failed: #{e.message}") }
       end
 
-      def notify_progress(key, chunk)
+      def notify_progress(key, chunk, total_points: nil, first_chunk: false)
         # Hook for UI updates; by default does nothing but can be extended.
         if respond_to?(:on_chunk)
-          on_chunk(key, chunk)
+          begin
+            on_chunk(key, chunk, total_points: total_points, first_chunk: first_chunk)
+          rescue ArgumentError
+            on_chunk(key, chunk)
+          end
         end
       end
 
