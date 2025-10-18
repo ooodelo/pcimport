@@ -39,6 +39,7 @@ require_relative 'core/spatial/index_builder'
 require_relative 'core/spatial/frustum'
 require_relative 'core/spatial/knn'
 require_relative 'core/lod/reservoir'
+require_relative 'core/lod/budget_distributor'
 require_relative 'core/lod/prefetcher'
 require_relative 'core/lod/pipeline'
 require_relative 'bridge/main_thread_queue'
@@ -71,7 +72,6 @@ module PointCloudPlugin
     submenu = extensions_menu.add_submenu('Point Cloud Importer')
     submenu.add_item('Import Point Cloud...') { start_import }
     submenu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
-    submenu.add_item('Activate Point Cloud Tool') { activate_tool }
     @menu_created = true
     log('Menu items registered')
   end
@@ -83,8 +83,8 @@ module PointCloudPlugin
     command = ::UI::Command.new('Import Point Cloud...') do
       start_import
     end
-    command.tooltip = 'Import and activate the point cloud tool'
-    command.status_bar_text = 'Open a point cloud file and activate the viewer tool'
+    command.tooltip = 'Import a point cloud file'
+    command.status_bar_text = 'Open a point cloud file for viewing'
 
     toolbar = ::UI::Toolbar.new('Point Cloud Importer')
     toolbar.add_item(command)

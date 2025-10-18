@@ -1,79 +1,140 @@
 # frozen_string_literal: true
 
-require_relative 'morton'
+require_relative 'octree'
 
 module PointCloudPlugin
   module Core
     module Spatial
-      # Builds a spatial index for chunks using Morton ordering.
+      # Builds and maintains an octree covering the chunks stored in memory.
       class IndexBuilder
-        def initialize(chunk_store)
+        DEFAULT_MAX_DEPTH = 8
+        DEFAULT_MAX_POINTS = 200_000
+        DEFAULT_MAX_CHUNKS = 8
+
+        attr_reader :root
+
+        def initialize(chunk_store, max_depth: DEFAULT_MAX_DEPTH, max_points_per_node: DEFAULT_MAX_POINTS,
+                       max_chunks_per_node: DEFAULT_MAX_CHUNKS)
           @chunk_store = chunk_store
+          @max_depth = max_depth
+          @max_points_per_node = max_points_per_node
+          @max_chunks_per_node = max_chunks_per_node
+          @chunk_to_node = {}
+          @root = nil
         end
-
-        DEFAULT_QUANTIZATION_BITS = 16
-
-        AXIS_KEYS = %i[x y z].freeze
 
         def build
           entries = []
           @chunk_store.each_in_memory do |key, chunk|
-            center = chunk.metadata[:bounds][:min]
-                          .zip(chunk.metadata[:bounds][:max])
-                          .map { |min, max| (min + max) * 0.5 }
+            bounds = chunk.metadata[:bounds]
+            next unless bounds
 
-            quantization_bits = chunk.metadata[:quantization_bits] || DEFAULT_QUANTIZATION_BITS
-            max_value = (1 << quantization_bits) - 1
-            origin = chunk.origin || [0.0, 0.0, 0.0]
-            scales = axis_scales(chunk.scale)
-
-            quantized_center = center.each_with_index.map do |component, axis|
-              axis_origin = origin[axis] || 0.0
-              axis_scale = scales[axis]
-              relative = component - axis_origin
-              quantized = axis_scale.zero? ? 0.0 : relative / axis_scale
-              quantized.round.clamp(0, max_value)
-            end
-
-            code = Morton.encode(*quantized_center)
-            entries << [key, code]
+            entries << [key, chunk]
           end
 
-          entries.sort_by { |entry| entry[1] }.map(&:first)
+          rebuild(entries)
+        end
+
+        def add_chunk(key, chunk)
+          bounds = chunk.metadata[:bounds]
+          return unless bounds
+
+          if @root.nil?
+            initialize_root(bounds)
+          elsif !contains_bounds?(@root.bbox, bounds)
+            rebuild(existing_chunks + [[key, chunk]])
+            return @chunk_to_node[key]
+          end
+
+          node = @root.add_chunk(
+            key: key,
+            bounds: bounds,
+            point_count: chunk.size,
+            max_depth: @max_depth,
+            max_points_per_node: @max_points_per_node,
+            max_chunks_per_node: @max_chunks_per_node
+          )
+
+          @chunk_to_node[key] = node
+          node
+        end
+
+        def node_for(key)
+          @chunk_to_node[key]
+        end
+
+        def visible_nodes(frustum)
+          return [] unless @root
+
+          @root.visible_nodes(frustum)
         end
 
         private
 
-        def axis_scales(scale)
-          case scale
-          when Hash
-            default = scale.values.compact.first || 1.0
-            AXIS_KEYS.map { |axis| fetch_axis_scale(scale, axis, default) }
-          when Array
-            expand_array_scale(scale)
-          else
-            value = scale || 1.0
-            [value, value, value]
-          end.map { |value| sanitize_scale(value) }
+        def rebuild(entries)
+          unless entries.any?
+            @root = nil
+            @chunk_to_node.clear
+            return
+          end
+
+          bounds = combined_bounds(entries.map { |(_, chunk)| chunk.metadata[:bounds] })
+          initialize_root(bounds)
+
+          @chunk_to_node.clear
+
+          entries.each do |key, chunk|
+            node = @root.add_chunk(
+              key: key,
+              bounds: chunk.metadata[:bounds],
+              point_count: chunk.size,
+              max_depth: @max_depth,
+              max_points_per_node: @max_points_per_node,
+              max_chunks_per_node: @max_chunks_per_node
+            )
+            @chunk_to_node[key] = node
+          end
+
+          @root
         end
 
-        def fetch_axis_scale(scale, axis, default)
-          scale[axis] || scale[axis.to_s] || default
+        def existing_chunks
+          @chunk_to_node.keys.map do |key|
+            chunk = @chunk_store.fetch(key)
+            [key, chunk] if chunk
+          end.compact
         end
 
-        def expand_array_scale(scale)
-          return [1.0, 1.0, 1.0] if scale.empty?
+        def initialize_root(bounds)
+          normalized = normalize_bounds(bounds)
+          @root = OctreeNode.new(bbox: normalized, depth: 0)
+        end
 
-          if scale.length >= 3
-            scale.first(3)
-          else
-            Array.new(3, scale.first)
+        def combined_bounds(bounds_list)
+          mins = [Float::INFINITY, Float::INFINITY, Float::INFINITY]
+          maxs = [-Float::INFINITY, -Float::INFINITY, -Float::INFINITY]
+
+          bounds_list.each do |bounds|
+            3.times do |axis|
+              mins[axis] = [mins[axis], bounds[:min][axis]].min
+              maxs[axis] = [maxs[axis], bounds[:max][axis]].max
+            end
+          end
+
+          { min: mins, max: maxs }
+        end
+
+        def contains_bounds?(outer, inner)
+          3.times.all? do |axis|
+            inner[:min][axis] >= outer[:min][axis] && inner[:max][axis] <= outer[:max][axis]
           end
         end
 
-        def sanitize_scale(value)
-          value = value.to_f
-          value.zero? ? 1.0 : value
+        def normalize_bounds(bounds)
+          {
+            min: bounds[:min].map(&:to_f),
+            max: bounds[:max].map(&:to_f)
+          }
         end
       end
     end

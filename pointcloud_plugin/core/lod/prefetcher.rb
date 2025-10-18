@@ -31,13 +31,18 @@ module PointCloudPlugin
 
           frustum = extend_frustum(frustum, movement_vector)
 
-          ordered_keys = @index_builder.build
-          visible = ordered_keys.select do |key|
-            chunk = @chunk_store.fetch(key)
-            chunk && frustum.intersects_bounds?(chunk.metadata[:bounds])
-          end
+          root = @index_builder.build
+          return unless root
 
-          @chunk_store.prefetch(visible.first(budget))
+          nodes = if frustum
+                    visible = @index_builder.visible_nodes(frustum)
+                    visible.empty? ? root.visible_nodes(nil) : visible
+                  else
+                    root.visible_nodes(nil)
+                  end
+
+          keys = nodes.flat_map { |node| node.chunk_refs.map { |ref| ref[:key] } }.uniq
+          @chunk_store.prefetch(keys.first(budget))
         end
 
         private

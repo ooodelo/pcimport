@@ -174,7 +174,11 @@ module PointCloudPlugin
             budget: @settings[:budget],
             camera_position: camera_position
           )
-          cloud.pipeline.next_chunks(frame_budget: @settings[:budget]).each do |key, chunk|
+          cloud.pipeline.next_chunks(
+            frame_budget: @settings[:budget],
+            frustum: frustum,
+            camera_position: camera_position
+          ).each do |key, chunk|
             next unless chunk
 
             next unless chunk_visible?(chunk, frustum)

@@ -3,67 +3,106 @@
 require_relative '../chunk_store'
 require_relative '../chunk'
 require_relative 'reservoir'
-require_relative '../spatial/morton'
+require_relative 'budget_distributor'
+require_relative '../spatial/index_builder'
 
 module PointCloudPlugin
   module Core
     module Lod
-      # Coordinates chunk submission, Morton sorting and frame budgeting.
+      # Coordinates chunk submission and frame budgeting using an octree.
       class Pipeline
-        MAX_MORTON_COORD = (1 << 21) - 1
-
-        attr_reader :chunk_store, :reservoir
+        attr_reader :chunk_store, :reservoir, :index_builder
 
         def initialize(chunk_store:, reservoir_size: 5_000)
           @chunk_store = chunk_store
-          @reservoir = Reservoir.new(reservoir_size)
-          @render_queue = []
+          @reservoir = ReservoirLOD.new(reservoir_size)
+          @budget_distributor = BudgetDistributor.new
+          @index_builder = Spatial::IndexBuilder.new(chunk_store)
+          @chunk_nodes = {}
           @budget = 1
-          @global_bounds = nil
         end
 
         def submit_chunk(key, chunk)
           chunk_store.store(key, chunk)
-          update_global_bounds(chunk)
-          enqueue(key, chunk)
-          update_reservoir(chunk)
+          node = index_builder.add_chunk(key, chunk)
+          @chunk_nodes[key] = node
+          update_reservoir(node, chunk)
         end
 
-        def next_chunks(frame_budget: @budget)
+        def next_chunks(frame_budget: @budget, frustum: nil, camera_position: nil)
           @budget = frame_budget
           budget = frame_budget
           unlimited_budget = budget.nil? || budget <= 0
-          selected = []
-          points_accumulated = 0
+          visible_nodes = determine_visible_nodes(frustum)
+          return [] if visible_nodes.empty?
 
-          while (entry = @render_queue.first)
-            break unless unlimited_budget || points_accumulated < budget
-
-            key, _morton, point_count = entry
-            remaining_budget = unlimited_budget ? point_count : budget - points_accumulated
-            break unless unlimited_budget || remaining_budget.positive?
-
-            @render_queue.shift
-
-            points_to_take = unlimited_budget ? point_count : [point_count, remaining_budget].min
-            selected << [key, points_to_take]
-            points_accumulated += points_to_take
+          if unlimited_budget
+            keys = ordered_keys_for_nodes(visible_nodes)
+            return keys.map { |key| [key, chunk_store.fetch(key)] }
           end
 
-          selected.map do |key, requested_points|
-            chunk = chunk_store.fetch(key)
-            chunk = downsample_chunk(chunk, requested_points) if requested_points.positive?
-            [key, chunk]
-          end
-        end
-
-        def enqueue(key, chunk)
-          morton = compute_morton_code(chunk)
-          @render_queue << [key, morton, chunk.size]
-          @render_queue.sort_by! { |_, value, _| value }
+          quotas = @budget_distributor.distribute(visible_nodes, budget, camera_position)
+          requests = allocate_chunk_requests(visible_nodes, quotas)
+          build_chunk_list(requests)
         end
 
         private
+
+        def determine_visible_nodes(frustum)
+          return [] unless index_builder.root
+
+          if frustum
+            index_builder.visible_nodes(frustum)
+          else
+            index_builder.root.visible_nodes(nil)
+          end
+        end
+
+        def ordered_keys_for_nodes(nodes)
+          nodes.flat_map { |node| node.chunk_refs.map { |ref| ref[:key] } }.uniq
+        end
+
+        def allocate_chunk_requests(nodes, quotas)
+          requests = Hash.new(0)
+
+          nodes.each do |node|
+            node_quota = quotas[node].to_i
+            next if node_quota <= 0 || node.chunk_refs.empty?
+
+            total_points = node.chunk_refs.sum { |ref| ref[:point_count] }
+            next if total_points <= 0
+
+            remaining = node_quota
+
+            node.chunk_refs.each_with_index do |ref, index|
+              share =
+                if index == node.chunk_refs.length - 1
+                  remaining
+                else
+                  ((node_quota * ref[:point_count]) / total_points.to_f).floor
+                end
+
+              share = [[share, 0].max, remaining].min
+              requests[ref[:key]] += share
+              remaining -= share
+              break if remaining <= 0
+            end
+          end
+
+          requests
+        end
+
+        def build_chunk_list(requests)
+          requests.each_with_object([]) do |(key, requested_points), list|
+            next if requested_points <= 0
+
+            chunk = chunk_store.fetch(key)
+            next unless chunk
+
+            sampled = downsample_chunk(chunk, requested_points)
+            list << [key, sampled]
+          end
+        end
 
         def downsample_chunk(chunk, target_points)
           return chunk if chunk.nil?
@@ -116,49 +155,10 @@ module PointCloudPlugin
           indices
         end
 
-        def update_reservoir(chunk)
-          chunk.each_point do |point|
-            reservoir.offer(point)
-          end
-        end
+        def update_reservoir(node, chunk)
+          return unless node
 
-        def update_global_bounds(chunk)
-          bounds = chunk.metadata && chunk.metadata[:bounds]
-          return unless bounds
-
-          min_bounds = bounds[:min]
-          max_bounds = bounds[:max]
-          return unless min_bounds && max_bounds
-
-          if @global_bounds
-            3.times do |axis|
-              @global_bounds[:min][axis] = [@global_bounds[:min][axis], min_bounds[axis]].min
-              @global_bounds[:max][axis] = [@global_bounds[:max][axis], max_bounds[axis]].max
-            end
-          else
-            @global_bounds = {
-              min: min_bounds.dup,
-              max: max_bounds.dup
-            }
-          end
-        end
-
-        def compute_morton_code(chunk)
-          bounds = chunk.metadata && chunk.metadata[:bounds]
-          return 0 unless bounds
-
-          center = bounds[:min].zip(bounds[:max]).map { |min, max| (min + max) * 0.5 }
-          global_bounds = @global_bounds || bounds
-
-          quantized = center.each_with_index.map do |component, axis|
-            min = global_bounds[:min][axis]
-            max = global_bounds[:max][axis]
-            range = max - min
-            normalized = range.zero? ? 0.0 : (component - min) / range
-            (normalized * MAX_MORTON_COORD).round.clamp(0, MAX_MORTON_COORD)
-          end
-
-          Spatial::Morton.encode(*quantized)
+          reservoir.update_node(node.id, chunk.each_point)
         end
       end
     end
