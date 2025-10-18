@@ -99,7 +99,22 @@ module PointCloudPlugin
            end
     return unless path
 
-    reader = build_reader(path)
+    import_defaults = tool.settings_dialog.import_options
+
+    if defined?(::UI) && ::UI.const_defined?(:HtmlDialog)
+      tool.settings_dialog.show_import_dialog(import_defaults) do |options|
+        begin_import(path, options)
+      end
+    else
+      begin_import(path, import_defaults)
+    end
+  end
+
+  def begin_import(path, options)
+    options ||= {}
+    unit = (options[:unit] || :meter).to_sym
+    offset = options[:offset] || {}
+    reader = build_reader(path, unit: unit, offset: offset)
     cache_root = File.join(Dir.tmpdir, 'pointcloud_cache')
     FileUtils.mkdir_p(cache_root)
     cache_path = File.join(cache_root, File.basename(path, '.*'))
@@ -128,13 +143,13 @@ module PointCloudPlugin
     end
   end
 
-  def build_reader(path)
+  def build_reader(path, unit: :meter, offset: nil)
     ext = File.extname(path).downcase
     case ext
     when '.ply'
-      Core::Readers::PlyReader.new(path)
+      Core::Readers::PlyReader.new(path, unit: unit, offset: offset)
     when '.xyz'
-      Core::Readers::XyzReader.new(path)
+      Core::Readers::XyzReader.new(path, unit: unit, offset: offset)
     else
       raise ArgumentError, "Unsupported file type: #{ext}"
     end
