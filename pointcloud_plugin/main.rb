@@ -107,9 +107,17 @@ module PointCloudPlugin
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
     job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
 
-    job.define_singleton_method(:on_chunk) do |key, chunk|
+    job.instance_variable_set(:@preview_initialized, false)
+    job.define_singleton_method(:on_chunk) do |key, chunk, info = {}|
       PointCloudPlugin.tool.hud.update(last_chunk: key, last_points: chunk.size)
       PointCloudPlugin.activate_tool
+
+      first_chunk = info.is_a?(Hash) ? info[:first_chunk] : false
+      unless @preview_initialized
+        if first_chunk && PointCloudPlugin.focus_camera_on_chunk(chunk)
+          @preview_initialized = true
+        end
+      end
     end
 
     id = manager.register_cloud(name: File.basename(path), pipeline: pipeline, job: job)
@@ -139,6 +147,29 @@ module PointCloudPlugin
     tools.push_tool(tool) unless tools.active_tool?(tool)
   rescue NoMethodError
     tools.push_tool(tool)
+  end
+
+  def focus_camera_on_chunk(chunk)
+    return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+    bounds = chunk&.metadata&.fetch(:bounds, nil)
+    return unless bounds
+
+    mins = bounds[:min]
+    maxs = bounds[:max]
+    return unless mins && maxs
+
+    view = Sketchup.active_model&.active_view
+    return unless view && view.respond_to?(:zoom) && defined?(Geom)
+
+    bounding_box = Geom::BoundingBox.new
+    bounding_box.add(Geom::Point3d.new(*mins))
+    bounding_box.add(Geom::Point3d.new(*maxs))
+    view.zoom(bounding_box)
+    view.invalidate if view.respond_to?(:invalidate)
+    true
+  rescue NoMethodError
+    false
   end
 
 end
