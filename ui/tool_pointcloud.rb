@@ -135,8 +135,9 @@ module PointCloudPlugin
         return unless entry
 
         @chunk_usage.delete(key)
-        store = entry[:store]
-        store.release(key) if store.respond_to?(:release)
+        # Keep the chunk cached so it can be reloaded when it becomes visible
+        # again. Releasing would remove it entirely from the ChunkStore, making
+        # it impossible for the prefetcher to rediscover it.
       end
 
       def update_snap_target(view, x, y)
