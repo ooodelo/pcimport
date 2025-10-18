@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 begin
-  require 'sketchup'
-  require 'extensions'
+  require 'sketchup.rb'
+  require 'extensions.rb'
 rescue LoadError
   # Allow the code to be loaded outside of SketchUp for testing.
 end
