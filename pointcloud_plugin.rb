@@ -96,9 +96,26 @@ module PointCloudPlugin
     return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
 
     tools = Sketchup.active_model.tools
-    tools.push_tool(tool) unless tools.active_tool?(tool)
+    if tools.respond_to?(:active_tool)
+      current_tool = tools.active_tool
+      return if current_tool.equal?(tool)
+    end
+
+    return if @tool_active
+
+    tools.push_tool(tool)
+    @tool_active = true
   rescue NoMethodError
     tools.push_tool(tool)
+    @tool_active = true
+  end
+
+  def tool_deactivated
+    @tool_active = false
+  end
+
+  def tool_activated
+    @tool_active = true
   end
 
   def register_extension

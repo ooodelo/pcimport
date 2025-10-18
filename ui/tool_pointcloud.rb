@@ -24,10 +24,12 @@ module PointCloudPlugin
       end
 
       def activate
+        PointCloudPlugin.tool_activated
         settings_dialog.show
       end
 
       def deactivate(view)
+        PointCloudPlugin.tool_deactivated
         view.invalidate if view.respond_to?(:invalidate)
       end
 
