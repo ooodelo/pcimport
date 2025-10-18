@@ -59,6 +59,11 @@ module PointCloudPlugin
         @lru.clear
       end
 
+      def release(key)
+        @entries.delete(key)
+        @lru.delete(key)
+      end
+
       private
 
       def persist_to_disk(key, chunk)
