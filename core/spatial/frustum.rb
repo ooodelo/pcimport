@@ -12,8 +12,8 @@ module PointCloudPlugin
         attr_reader :planes, :epsilon
 
         def self.from_view_matrices(modelview, projection, epsilon: DEFAULT_EPSILON)
-          mv = to_matrix(modelview)
-          proj = to_matrix(projection)
+          mv = transpose_matrix(to_matrix(modelview))
+          proj = transpose_matrix(to_matrix(projection))
           clip = multiply_matrices(proj, mv)
           from_clip_matrix(clip, epsilon: epsilon)
         end
@@ -38,6 +38,13 @@ module PointCloudPlugin
           values.each_slice(4).map { |row| row.map(&:to_f) }
         end
         private_class_method :to_matrix
+
+        def self.transpose_matrix(matrix)
+          Array.new(4) do |row|
+            Array.new(4) { |col| matrix[col][row] }
+          end
+        end
+        private_class_method :transpose_matrix
 
         def self.multiply_matrices(a, b)
           Array.new(4) do |row|
