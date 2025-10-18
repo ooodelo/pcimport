@@ -4,8 +4,8 @@ require 'tmpdir'
 require 'fileutils'
 
 begin
-  require 'sketchup'
-  require 'extensions'
+  require 'sketchup.rb'
+  require 'extensions.rb'
 rescue LoadError
   # Allow the code to be loaded outside of SketchUp for testing.
 end
@@ -31,9 +31,9 @@ require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
 
 module PointCloudPlugin
-  EXTENSION_ID = 'com.example.pointcloud'
-  EXTENSION_NAME = 'Point Cloud Importer'
-  EXTENSION_VERSION = '0.1.0'
+  EXTENSION_ID ||= 'com.example.pointcloud'
+  EXTENSION_NAME ||= 'Point Cloud Importer'
+  EXTENSION_VERSION ||= '0.1.0'
 
   module_function
 
