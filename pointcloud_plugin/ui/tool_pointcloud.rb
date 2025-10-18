@@ -22,6 +22,7 @@ module PointCloudPlugin
         @settings = @settings_dialog.settings
         @active_chunks = {}
         @chunk_usage = []
+        @active_point_count = 0
         @snap_target = nil
         hook_settings
       end
@@ -179,7 +180,12 @@ module PointCloudPlugin
       end
 
       def store_active_chunk(key, chunk, store)
+        if (existing = @active_chunks[key])
+          @active_point_count -= existing[:chunk].size
+        end
+
         @active_chunks[key] = { chunk: chunk, store: store }
+        @active_point_count += chunk.size
         touch_chunk(key)
       end
 
@@ -193,8 +199,11 @@ module PointCloudPlugin
           evict_chunk(stale_key)
         end
 
-        while @chunk_usage.size > @settings[:budget]
-          evict_chunk(@chunk_usage.last)
+        while @active_point_count > @settings[:budget]
+          key = @chunk_usage.last
+          break unless key
+
+          evict_chunk(key)
         end
       end
 
@@ -204,6 +213,8 @@ module PointCloudPlugin
 
         @chunk_usage.delete(key)
         store = entry[:store]
+        @active_point_count -= entry[:chunk].size
+        @active_point_count = 0 if @active_point_count.negative?
         store.release(key) if store.respond_to?(:release)
       end
 

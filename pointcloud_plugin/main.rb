@@ -99,13 +99,32 @@ module PointCloudPlugin
            end
     return unless path
 
+    if defined?(::UI) && tool.settings_dialog.respond_to?(:show_import_dialog)
+      tool.settings_dialog.show_import_dialog do |options|
+        perform_import(path, options)
+      end
+    else
+      perform_import(path, nil)
+    end
+  end
+
+  def perform_import(path, import_options)
+    options = normalize_import_options(import_options)
+
     reader = build_reader(path)
     cache_root = File.join(Dir.tmpdir, 'pointcloud_cache')
     FileUtils.mkdir_p(cache_root)
     cache_path = File.join(cache_root, File.basename(path, '.*'))
     chunk_store = Core::ChunkStore.new(cache_path: cache_path)
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
-    job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
+    job = Bridge::ImportJob.new(
+      path: path,
+      reader: reader,
+      pipeline: pipeline,
+      queue: manager.queue,
+      input_unit: options[:unit],
+      offset: options[:offset]
+    )
 
     job.instance_variable_set(:@preview_initialized, false)
     job.define_singleton_method(:on_chunk) do |key, chunk, info = {}|
@@ -126,6 +145,23 @@ module PointCloudPlugin
     job.start do
       tool.hud.update(status: 'Import complete')
     end
+  end
+
+  def normalize_import_options(options)
+    defaults = { unit: :meter, offset: { x: 0.0, y: 0.0, z: 0.0 } }
+    return defaults unless options.is_a?(Hash)
+
+    unit_value = options[:unit] || options['unit'] || defaults[:unit]
+    unit = unit_value.to_s.empty? ? defaults[:unit] : unit_value.to_s.downcase.to_sym
+
+    offset_source = options[:offset] || options['offset'] || {}
+    offset = {}
+    %i[x y z].each do |axis|
+      value = offset_source[axis] || offset_source[axis.to_s] || defaults[:offset][axis]
+      offset[axis] = value.to_f
+    end
+
+    { unit: unit, offset: offset }
   end
 
   def build_reader(path)

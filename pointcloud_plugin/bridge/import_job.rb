@@ -12,7 +12,7 @@ module PointCloudPlugin
     class ImportJob
       attr_reader :path, :reader, :pipeline, :queue, :progress
 
-      def initialize(path:, reader:, pipeline:, queue: MainThreadQueue.new)
+      def initialize(path:, reader:, pipeline:, queue: MainThreadQueue.new, input_unit: :meter, offset: { x: 0.0, y: 0.0, z: 0.0 })
         @path = path
         @reader = reader
         @pipeline = pipeline
@@ -20,6 +20,8 @@ module PointCloudPlugin
         @progress = 0.0
         @chunk_index = 0
         @thread = nil
+        @input_unit = input_unit
+        @offset = offset
       end
 
       def start(&block)
@@ -69,7 +71,7 @@ module PointCloudPlugin
       end
 
       def pack(batch)
-        packer = Core::ChunkPacker.new
+        packer = Core::ChunkPacker.new(input_unit: @input_unit, offset: @offset)
         packer.pack(batch)
       end
 

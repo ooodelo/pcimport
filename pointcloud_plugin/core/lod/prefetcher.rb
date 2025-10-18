@@ -15,12 +15,28 @@ module PointCloudPlugin
 
         def prefetch_for_view(frustum, budget: 8)
           ordered_keys = @index_builder.build
-          visible = ordered_keys.select do |key|
+
+          visible_chunks = []
+          ordered_keys.each do |key|
             chunk = @chunk_store.fetch(key)
-            chunk && frustum.intersects_bounds?(chunk.metadata[:bounds])
+            next unless chunk
+
+            bounds = chunk.metadata[:bounds]
+            next unless bounds && frustum.intersects_bounds?(bounds)
+
+            visible_chunks << [key, chunk]
           end
 
-          @chunk_store.prefetch(visible.first(budget))
+          selected_keys = []
+          remaining_points = budget
+
+          visible_chunks.each do |key, chunk|
+            selected_keys << key
+            remaining_points -= chunk.size
+            break if remaining_points <= 0
+          end
+
+          @chunk_store.prefetch(selected_keys)
         end
       end
     end
