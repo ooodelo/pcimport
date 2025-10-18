@@ -13,14 +13,10 @@ module PointCloudPlugin
   EXTENSION_VERSION ||= '0.1.0'
 
   unless respond_to?(:log)
-    def self.log(message)
+    def log(message)
       Kernel.puts("[PointCloudPlugin] #{message}")
     rescue StandardError
       nil
-    end
-
-    def log(message)
-      PointCloudPlugin.log(message)
     end
 
     module_function :log
