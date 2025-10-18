@@ -65,11 +65,32 @@ module PointCloudPlugin
 
   def setup_menu
     return unless defined?(::UI)
+    return if @menu_created
 
-    menu = ::UI.menu('File')
-    menu.add_item('Import Point Cloud...') { start_import }
-    menu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
+    extensions_menu = ::UI.menu('Extensions')
+    submenu = extensions_menu.add_submenu('Point Cloud Importer')
+    submenu.add_item('Import Point Cloud...') { start_import }
+    submenu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
+    submenu.add_item('Вставить облако') { activate_tool }
+    @menu_created = true
     log('Menu items registered')
+  end
+
+  def setup_toolbar
+    return unless defined?(::UI)
+    return if @toolbar&.valid?
+
+    command = ::UI::Command.new('Вставить облако') do
+      start_import
+    end
+    command.tooltip = 'Импорт и вставка облака точек'
+    command.status_bar_text = 'Открыть файл облака точек и активировать инструмент просмотра'
+
+    toolbar = ::UI::Toolbar.new('Point Cloud Importer')
+    toolbar.add_item(command)
+    toolbar.show
+    @toolbar = toolbar
+    log('Toolbar registered')
   end
 
   def start_import
@@ -122,5 +143,8 @@ module PointCloudPlugin
 
 end
 
-PointCloudPlugin.setup_menu if defined?(::UI)
+if defined?(::UI)
+  PointCloudPlugin.setup_menu
+  PointCloudPlugin.setup_toolbar
+end
 PointCloudPlugin.log('Runtime load complete') if defined?(PointCloudPlugin)
