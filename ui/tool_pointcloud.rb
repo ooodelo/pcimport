@@ -98,9 +98,22 @@ module PointCloudPlugin
         evict_stale_chunks(visible_keys)
       end
 
-      def current_frustum(_view)
-        planes = []
-        Core::Spatial::Frustum.new(planes)
+      def current_frustum(view)
+        epsilon = Core::Spatial::Frustum::DEFAULT_EPSILON
+        return Core::Spatial::Frustum.new([], epsilon: epsilon) unless view
+
+        camera = view.respond_to?(:camera) ? view.camera : nil
+
+        modelview = extract_matrix(camera, :modelview_matrix) || extract_matrix(view, :modelview_matrix, :modelview)
+        projection = extract_matrix(camera, :projection_matrix) || extract_matrix(view, :projection_matrix, :projection)
+
+        if modelview && projection
+          Core::Spatial::Frustum.from_view_matrices(modelview, projection, epsilon: epsilon)
+        else
+          Core::Spatial::Frustum.new([], epsilon: epsilon)
+        end
+      rescue ArgumentError
+        Core::Spatial::Frustum.new([], epsilon: epsilon)
       end
 
       def chunk_visible?(chunk, frustum)
@@ -108,6 +121,19 @@ module PointCloudPlugin
         return true unless bounds
 
         frustum.intersects_bounds?(bounds)
+      end
+
+      def extract_matrix(source, *candidates)
+        return unless source
+
+        candidates.each do |method_name|
+          next unless source.respond_to?(method_name)
+
+          matrix = source.public_send(method_name)
+          return matrix if matrix
+        end
+
+        nil
       end
 
       def store_active_chunk(key, chunk, store)
