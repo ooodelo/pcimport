@@ -50,8 +50,26 @@ module PointCloudPlugin
         end
 
         if view.respond_to?(:draw_points)
-          sketchup_points = points.map { |pos| Geom::Point3d.new(*pos) }
-          view.draw_points(sketchup_points, @settings[:point_size], 1, 'black')
+          sketchup_points = []
+          points.each do |pos|
+            if pos.is_a?(Geom::Point3d)
+              sketchup_points << pos
+              next
+            end
+
+            coordinates = pos.respond_to?(:to_a) ? pos.to_a : pos
+            next unless coordinates.is_a?(Array) && coordinates.length >= 3
+
+            sketchup_points << Geom::Point3d.new(*coordinates)
+          end
+
+          color = if defined?(Sketchup::Color)
+                    Sketchup::Color.new(0, 0, 0)
+                  else
+                    'black'
+                  end
+
+          view.draw_points(sketchup_points, @settings[:point_size], 1, color) unless sketchup_points.empty?
           draw_snap(view)
           hud.draw(view)
         end
