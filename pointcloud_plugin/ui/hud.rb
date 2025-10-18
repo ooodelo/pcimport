@@ -18,7 +18,8 @@ module PointCloudPlugin
         return unless view.respond_to?(:draw_text)
 
         lines = metrics.map { |key, value| "#{key}: #{value}" }
-        view.draw_text([20, 40, 0], lines.join("\n"))
+        origin = Geom::Point3d.new(20, 40, 0)
+        view.draw_text(origin, lines.join("\n"))
       end
     end
   end
