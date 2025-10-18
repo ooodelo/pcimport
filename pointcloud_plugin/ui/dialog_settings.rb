@@ -7,11 +7,19 @@ module PointCloudPlugin
     # Settings dialog for adjusting runtime parameters.
     class DialogSettings
       DEFAULTS = {
-        budget: 8,
+        budget: 2_000_000,
         point_size: 2,
         snap_radius: 5.0,
         memory_limit: 512
       }.freeze
+
+      IMPORT_UNITS = [
+        [:meter, 'Meters'],
+        [:millimeter, 'Millimeters'],
+        [:centimeter, 'Centimeters'],
+        [:foot, 'Feet'],
+        [:inch, 'Inches']
+      ].freeze
 
       attr_reader :settings
 
@@ -34,26 +42,229 @@ module PointCloudPlugin
       private
 
       def build_dialog
-        dialog = ::UI::HtmlDialog.new(dialog_title: 'Point Cloud Settings', width: 360, height: 400)
+        dialog = ::UI::HtmlDialog.new(dialog_title: 'Point Cloud Settings', width: 360, height: 360)
+        budget_millions = (settings[:budget].to_f / 1_000_000.0)
+        budget_display = format('%.1f', budget_millions)
         html = <<~HTML
           <html>
+            <head>
+              <style>
+                body { font-family: sans-serif; margin: 16px; }
+                label { display: block; margin-bottom: 12px; }
+                .section { margin-bottom: 24px; }
+                .slider-row { display: flex; align-items: center; gap: 12px; }
+                .slider-row span { min-width: 110px; font-weight: bold; }
+                .buttons { display: flex; gap: 12px; }
+              </style>
+            </head>
             <body>
-              <label>Frame budget: <input id="budget" type="number" min="1" value="#{settings[:budget]}"></label><br>
-              <label>Point size: <input id="point_size" type="number" min="1" value="#{settings[:point_size]}"></label><br>
-              <label>Snap radius: <input id="snap_radius" type="number" step="0.1" value="#{settings[:snap_radius]}"></label><br>
-              <label>Memory limit (MB): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label><br>
-              <button onclick="sketchup.apply(JSON.stringify({ budget: parseInt(budget.value), point_size: parseInt(point_size.value), snap_radius: parseFloat(snap_radius.value), memory_limit: parseInt(memory_limit.value) }))">Apply</button>
+              <div class="section">
+                <label>Frame budget</label>
+                <div class="slider-row">
+                  <input id="budget_slider" type="range" min="0.5" max="5" step="0.1" value="#{budget_display}">
+                  <span id="budget_value">#{budget_display} M points</span>
+                </div>
+                <button id="panic_button" type="button">Panic</button>
+              </div>
+              <div class="section">
+                <label>Point size: <input id="point_size" type="number" min="1" value="#{settings[:point_size]}"></label>
+                <label>Snap radius: <input id="snap_radius" type="number" step="0.1" value="#{settings[:snap_radius]}"></label>
+                <label>Memory limit (MB): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label>
+              </div>
+              <div class="buttons">
+                <button id="apply_button" type="button">Apply</button>
+                <button id="cancel_button" type="button">Cancel</button>
+              </div>
+              <script>
+                (function() {
+                  const slider = document.getElementById('budget_slider');
+                  const display = document.getElementById('budget_value');
+                  const panicButton = document.getElementById('panic_button');
+                  const applyButton = document.getElementById('apply_button');
+                  const cancelButton = document.getElementById('cancel_button');
+
+                  function updateDisplay() {
+                    const value = parseFloat(slider.value);
+                    display.textContent = value.toFixed(1) + ' M points';
+                  }
+
+                  slider.addEventListener('input', updateDisplay);
+                  updateDisplay();
+
+                  panicButton.addEventListener('click', function() {
+                    const min = parseFloat(slider.min);
+                    const current = parseFloat(slider.value);
+                    const next = Math.max(min, current / 2);
+                    slider.value = next.toFixed(1);
+                    slider.dispatchEvent(new Event('input'));
+                  });
+
+                  applyButton.addEventListener('click', function() {
+                    const payload = {
+                      budget: Math.round(parseFloat(slider.value) * 1000000),
+                      point_size: parseInt(document.getElementById('point_size').value, 10),
+                      snap_radius: parseFloat(document.getElementById('snap_radius').value),
+                      memory_limit: parseInt(document.getElementById('memory_limit').value, 10)
+                    };
+                    if (window.sketchup && typeof window.sketchup.apply === 'function') {
+                      window.sketchup.apply(JSON.stringify(payload));
+                    }
+                  });
+
+                  cancelButton.addEventListener('click', function() {
+                    window.close();
+                  });
+                })();
+              </script>
             </body>
           </html>
         HTML
         dialog.set_html(html)
         dialog.add_action_callback('apply') do |_context, payload|
           data = JSON.parse(payload)
-          @settings.merge!(data.transform_keys(&:to_sym))
+          @settings[:budget] = data['budget'].to_i if data.key?('budget')
+          @settings[:point_size] = data['point_size'].to_i if data.key?('point_size')
+          @settings[:snap_radius] = data['snap_radius'].to_f if data.key?('snap_radius')
+          @settings[:memory_limit] = data['memory_limit'].to_i if data.key?('memory_limit')
           @on_change&.call(@settings)
         end
         dialog
       end
+
+      def show_import_dialog(initial_options = {})
+        overrides = initial_options || {}
+        defaults = merge_import_defaults(import_options.merge(overrides))
+
+        unless defined?(::UI) && ::UI.const_defined?(:HtmlDialog)
+          yield defaults if block_given?
+          @last_import_options = defaults
+          return nil
+        end
+
+        dialog = ::UI::HtmlDialog.new(dialog_title: 'Import Options', width: 360, height: 320)
+        options_markup = IMPORT_UNITS.map do |value, label|
+          selected = value.to_s == defaults[:unit].to_s ? ' selected' : ''
+          "<option value=\"#{value}\"#{selected}>#{label}</option>"
+        end.join
+        offset = defaults[:offset]
+
+        html = <<~HTML
+          <html>
+            <head>
+              <style>
+                body { font-family: sans-serif; margin: 16px; }
+                label { display: block; margin-bottom: 12px; }
+                .offset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+                .buttons { display: flex; gap: 12px; }
+              </style>
+            </head>
+            <body>
+              <label for="import_unit">Units:
+                <select id="import_unit">
+                  #{options_markup}
+                </select>
+              </label>
+              <div class="offset-grid">
+                <label>X offset: <input id="offset_x" type="number" step="0.01" value="#{offset[:x]}"></label>
+                <label>Y offset: <input id="offset_y" type="number" step="0.01" value="#{offset[:y]}"></label>
+                <label>Z offset: <input id="offset_z" type="number" step="0.01" value="#{offset[:z]}"></label>
+              </div>
+              <div class="buttons">
+                <button id="apply_button" type="button">Apply</button>
+                <button id="cancel_button" type="button">Cancel</button>
+              </div>
+              <script>
+                (function() {
+                  const applyButton = document.getElementById('apply_button');
+                  const cancelButton = document.getElementById('cancel_button');
+
+                  applyButton.addEventListener('click', function() {
+                    const payload = {
+                      unit: document.getElementById('import_unit').value,
+                      offset_x: parseFloat(document.getElementById('offset_x').value || 0),
+                      offset_y: parseFloat(document.getElementById('offset_y').value || 0),
+                      offset_z: parseFloat(document.getElementById('offset_z').value || 0)
+                    };
+                    if (window.sketchup && typeof window.sketchup.import_options === 'function') {
+                      window.sketchup.import_options(JSON.stringify(payload));
+                    }
+                  });
+
+                  cancelButton.addEventListener('click', function() {
+                    window.close();
+                  });
+                })();
+              </script>
+            </body>
+          </html>
+        HTML
+        dialog.set_html(html)
+        dialog.add_action_callback('import_options') do |_context, payload|
+          options = normalize_import_options(JSON.parse(payload))
+          @last_import_options = options
+          yield options if block_given?
+          dialog.close
+        end
+        dialog.show
+        @import_dialog = dialog
+      end
+
+      def import_options
+        stored = @last_import_options ||= merge_import_defaults({})
+        {
+          unit: stored[:unit],
+          offset: stored[:offset].dup
+        }
+      end
+
+      def merge_import_defaults(overrides)
+        defaults = { unit: :meter, offset: { x: 0.0, y: 0.0, z: 0.0 } }
+        overrides = overrides.transform_keys(&:to_sym) if overrides.respond_to?(:transform_keys)
+
+        unit = overrides && overrides[:unit] ? overrides[:unit].to_sym : defaults[:unit]
+        offset_source = extract_offset_source(overrides)
+
+        offset = defaults[:offset].merge({
+                                       x: fetch_offset_value(offset_source, :x),
+                                       y: fetch_offset_value(offset_source, :y),
+                                       z: fetch_offset_value(offset_source, :z)
+                                     })
+
+        { unit: unit, offset: offset }
+      end
+
+      def extract_offset_source(overrides)
+        return {} unless overrides
+
+        if overrides[:offset]
+          source = overrides[:offset]
+          source.respond_to?(:transform_keys) ? source.transform_keys(&:to_sym) : source
+        else
+          {
+            x: overrides[:offset_x],
+            y: overrides[:offset_y],
+            z: overrides[:offset_z]
+          }
+        end
+      end
+
+      def fetch_offset_value(source, key)
+        value = source[key]
+        value = source[key.to_s] if value.nil? && source.respond_to?(:[])
+        value.nil? ? 0.0 : value.to_f
+      end
+
+      def normalize_import_options(options)
+        merged = merge_import_defaults(options)
+        {
+          unit: merged[:unit],
+          offset: merged[:offset]
+        }
+      end
+
+      public :show_import_dialog, :import_options
+
+      private
     end
   end
 end
