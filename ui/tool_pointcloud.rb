@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'set'
+
 require_relative '../bridge/point_cloud_manager'
 require_relative '../core/lod/pipeline'
 require_relative '../core/spatial/knn'
@@ -19,6 +21,7 @@ module PointCloudPlugin
         @settings_dialog = DialogSettings.new
         @settings = @settings_dialog.settings
         @active_chunks = {}
+        @chunk_usage = []
         @snap_target = nil
         hook_settings
       end
@@ -35,7 +38,11 @@ module PointCloudPlugin
         gather_chunks(view)
         points = []
 
-        @active_chunks.each_value do |chunk|
+        @chunk_usage.each do |key|
+          entry = @active_chunks[key]
+          next unless entry
+
+          chunk = entry[:chunk]
           chunk.size.times do |index|
             point = chunk.point_at(index)
             points << point[:position]
@@ -64,20 +71,72 @@ module PointCloudPlugin
 
       def gather_chunks(view)
         frustum = current_frustum(view)
+        visible_keys = Set.new
+
         manager.each_cloud do |cloud|
           cloud.prefetcher.prefetch_for_view(frustum, budget: @settings[:budget])
           cloud.pipeline.next_chunks(frame_budget: @settings[:budget]).each do |key, chunk|
             next unless chunk
 
-            @active_chunks[key] = chunk
+            next unless chunk_visible?(chunk, frustum)
+
+            store_active_chunk(key, chunk, cloud.pipeline.chunk_store)
+            visible_keys << key
             hud.update("cloud_#{cloud.id}_points" => chunk.size)
           end
         end
+
+        @active_chunks.each do |key, entry|
+          next if visible_keys.include?(key)
+
+          if chunk_visible?(entry[:chunk], frustum)
+            touch_chunk(key)
+            visible_keys << key
+          end
+        end
+
+        evict_stale_chunks(visible_keys)
       end
 
       def current_frustum(_view)
         planes = []
         Core::Spatial::Frustum.new(planes)
+      end
+
+      def chunk_visible?(chunk, frustum)
+        bounds = chunk.metadata[:bounds]
+        return true unless bounds
+
+        frustum.intersects_bounds?(bounds)
+      end
+
+      def store_active_chunk(key, chunk, store)
+        @active_chunks[key] = { chunk: chunk, store: store }
+        touch_chunk(key)
+      end
+
+      def touch_chunk(key)
+        @chunk_usage.delete(key)
+        @chunk_usage.unshift(key)
+      end
+
+      def evict_stale_chunks(visible_keys)
+        (@active_chunks.keys - visible_keys.to_a).each do |stale_key|
+          evict_chunk(stale_key)
+        end
+
+        while @chunk_usage.size > @settings[:budget]
+          evict_chunk(@chunk_usage.last)
+        end
+      end
+
+      def evict_chunk(key)
+        entry = @active_chunks.delete(key)
+        return unless entry
+
+        @chunk_usage.delete(key)
+        store = entry[:store]
+        store.release(key) if store.respond_to?(:release)
       end
 
       def update_snap_target(view, x, y)
