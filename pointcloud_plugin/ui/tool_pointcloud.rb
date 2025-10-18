@@ -163,12 +163,17 @@ module PointCloudPlugin
 
       def gather_chunks(view)
         frustum = current_frustum(view)
+        camera_position = current_camera_position(view)
         visible_keys = Set.new
         budget = @settings[:budget].to_i
         points_accumulated = 0
 
         manager.each_cloud do |cloud|
-          cloud.prefetcher.prefetch_for_view(frustum, budget: @settings[:budget])
+          cloud.prefetcher.prefetch_for_view(
+            frustum,
+            budget: @settings[:budget],
+            camera_position: camera_position
+          )
           cloud.pipeline.next_chunks(frame_budget: @settings[:budget]).each do |key, chunk|
             next unless chunk
 
@@ -226,6 +231,21 @@ module PointCloudPlugin
         end
       rescue ArgumentError
         Core::Spatial::Frustum.new([], epsilon: epsilon)
+      end
+
+      def current_camera_position(view)
+        return unless view
+
+        camera = view.respond_to?(:camera) ? view.camera : nil
+        return unless camera
+
+        position = if camera.respond_to?(:eye)
+                     camera.eye
+                   elsif camera.respond_to?(:position)
+                     camera.position
+                   end
+
+        to_coordinates(position)
       end
 
       def chunk_visible?(chunk, frustum)

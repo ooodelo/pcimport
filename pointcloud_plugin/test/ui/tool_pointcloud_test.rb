@@ -34,12 +34,14 @@ module PointCloudPlugin
           @frustums = []
         end
 
-        def prefetch_for_view(frustum, budget: 0)
+        def prefetch_for_view(frustum, budget: 0, camera_position: nil)
           @frustums << frustum
           @last_budget = budget
+          @last_camera_position = camera_position
         end
 
         attr_reader :last_budget
+        attr_reader :last_camera_position
       end
 
       class FakePipeline
@@ -56,9 +58,10 @@ module PointCloudPlugin
       end
 
       class FakeCamera
-        def initialize(modelview, projection)
+        def initialize(modelview, projection, eye = [0.0, 0.0, 0.0])
           @modelview = modelview
           @projection = projection
+          @eye = eye
         end
 
         def modelview_matrix
@@ -68,13 +71,17 @@ module PointCloudPlugin
         def projection_matrix
           @projection
         end
+
+        def eye
+          @eye
+        end
       end
 
       class FakeView
         attr_reader :camera
 
-        def initialize(modelview, projection)
-          @camera = FakeCamera.new(modelview, projection)
+        def initialize(modelview, projection, eye = [0.0, 0.0, 0.0])
+          @camera = FakeCamera.new(modelview, projection, eye)
         end
       end
 
