@@ -50,7 +50,8 @@ module PointCloudPlugin
         end
 
         if view.respond_to?(:draw_points)
-          view.draw_points(points, @settings[:point_size])
+          sketchup_points = points.map { |pos| Geom::Point3d.new(*pos) }
+          view.draw_points(sketchup_points, @settings[:point_size], 1, 'black')
           draw_snap(view)
           hud.draw(view)
         end
