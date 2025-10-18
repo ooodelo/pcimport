@@ -14,7 +14,7 @@ module PointCloudPlugin
 
         def initialize(chunk_store:, reservoir_size: 5_000)
           @chunk_store = chunk_store
-          @reservoir = Reservoir.new(reservoir_size)
+          @reservoir = ReservoirLOD.new(reservoir_size)
           @render_queue = []
           @budget = 1
         end
@@ -22,7 +22,7 @@ module PointCloudPlugin
         def submit_chunk(key, chunk)
           chunk_store.store(key, chunk)
           enqueue(key, chunk)
-          update_reservoir(chunk)
+          update_reservoir(key, chunk)
         end
 
         def next_chunks(frame_budget: @budget)
@@ -51,10 +51,8 @@ module PointCloudPlugin
 
         private
 
-        def update_reservoir(chunk)
-          chunk.each_point do |point|
-            reservoir.offer(point)
-          end
+        def update_reservoir(key, chunk)
+          reservoir.update_node(key, chunk.each_point)
         end
       end
     end
