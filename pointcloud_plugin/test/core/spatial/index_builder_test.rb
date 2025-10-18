@@ -3,13 +3,12 @@
 require 'minitest/autorun'
 
 require_relative '../../../core/spatial/index_builder'
-require_relative '../../../core/spatial/morton'
 
 module PointCloudPlugin
   module Core
     module Spatial
       class IndexBuilderTest < Minitest::Test
-        ChunkStub = Struct.new(:origin, :scale, :metadata)
+        ChunkStub = Struct.new(:metadata, :size)
 
         class FakeChunkStore
           def initialize(entries)
@@ -23,99 +22,67 @@ module PointCloudPlugin
               yield key, chunk
             end
           end
+
+          def fetch(key)
+            entry = @entries.find { |stored_key, _| stored_key == key }
+            entry&.last
+          end
         end
 
-        def test_morton_order_respects_translated_chunks
-          chunk_a = build_chunk(
-            origin: [1_000_000.0, 0.0, 0.0],
-            scale: { x: 0.01, y: 0.01, z: 0.01 },
-            bounds_max: [1_000_002.0, 2.0, 2.0]
-          )
-          chunk_b = build_chunk(
-            origin: [2_000_000.0, 0.0, 0.0],
-            scale: { x: 0.01, y: 0.01, z: 0.01 },
-            bounds_max: [2_000_003.0, 2.0, 2.0]
-          )
-          chunk_c = build_chunk(
-            origin: [3_000_000.0, 0.0, 0.0],
-            scale: { x: 0.01, y: 0.01, z: 0.01 },
-            bounds_max: [3_000_004.0, 2.0, 2.0]
-          )
+        def test_build_creates_octree_with_chunk_refs
+          chunk_a = chunk_stub(min: [0.0, 0.0, 0.0], max: [1.0, 1.0, 1.0], size: 100)
+          chunk_b = chunk_stub(min: [2.0, 0.0, 0.0], max: [3.0, 1.0, 1.0], size: 50)
 
           store = FakeChunkStore.new([
             ['chunk_a', chunk_a],
-            ['chunk_b', chunk_b],
-            ['chunk_c', chunk_c]
+            ['chunk_b', chunk_b]
           ])
 
-          builder = IndexBuilder.new(store)
-          morton_order = builder.build
+          builder = IndexBuilder.new(store, max_chunks_per_node: 1)
+          builder.build
+          root = builder.root
 
-          expected_order = expected_order_for(
-            'chunk_a' => chunk_a,
-            'chunk_b' => chunk_b,
-            'chunk_c' => chunk_c
-          )
+          refute_nil root
+          assert_in_delta 150, root.point_count, 1e-6
+          assert_equal 2, root.visible_nodes(nil).sum { |node| node.chunk_refs.length }
+        end
 
-          assert_equal expected_order, morton_order
-          assert_equal expected_order, spatial_x_order_for(
-            'chunk_a' => chunk_a,
-            'chunk_b' => chunk_b,
-            'chunk_c' => chunk_c
-          )
+        def test_visible_nodes_filters_by_frustum
+          near_chunk = chunk_stub(min: [0.0, 0.0, 0.0], max: [1.0, 1.0, 1.0], size: 10)
+          far_chunk = chunk_stub(min: [10.0, 2.0, 2.0], max: [11.0, 3.0, 3.0], size: 10)
+
+          store = FakeChunkStore.new([
+            ['near', near_chunk],
+            ['far', far_chunk]
+          ])
+
+          builder = IndexBuilder.new(store, max_chunks_per_node: 1)
+          builder.build
+          root = builder.root
+          frustum = HalfSpaceFrustum.new(1.0)
+
+          nodes = builder.visible_nodes(frustum)
+          keys = nodes.flat_map { |node| node.chunk_refs.map { |ref| ref[:key] } }
+
+          assert_includes keys, 'near'
+          refute_includes keys, 'far'
         end
 
         private
 
-        def build_chunk(origin:, scale:, bounds_max:, bits: 16)
-          metadata = {
-            bounds: {
-              min: origin,
-              max: bounds_max
-            },
-            quantization_bits: bits
-          }
-
-          ChunkStub.new(origin, scale, metadata)
+        def chunk_stub(min:, max:, size:)
+          metadata = { bounds: { min: min, max: max } }
+          ChunkStub.new(metadata, size)
         end
 
-        def expected_order_for(chunks)
-          chunks
-            .map { |key, chunk| [key, expected_code_for(chunk)] }
-            .sort_by { |(_, code)| code }
-            .map(&:first)
-        end
-
-        def expected_code_for(chunk)
-          center = chunk.metadata[:bounds][:min]
-                          .zip(chunk.metadata[:bounds][:max])
-                          .map { |min, max| (min + max) * 0.5 }
-          quantization_bits = chunk.metadata[:quantization_bits] || 16
-          max_value = (1 << quantization_bits) - 1
-          origin = chunk.origin || [0.0, 0.0, 0.0]
-          scales = [chunk.scale[:x], chunk.scale[:y], chunk.scale[:z]]
-          fallback_scale = scales.compact.first || 1.0
-
-          quantized = center.each_with_index.map do |component, axis|
-            relative = component - origin[axis]
-            scale = scales[axis] || fallback_scale
-            ((relative / scale).round).clamp(0, max_value)
+        class HalfSpaceFrustum
+          def initialize(max_x)
+            @max_x = max_x
           end
 
-          Morton.encode(*quantized)
-        end
-
-        def spatial_x_order_for(chunks)
-          chunks
-            .map { |key, chunk| [key, chunk_center(chunk)[0]] }
-            .sort_by { |(_, x_center)| x_center }
-            .map(&:first)
-        end
-
-        def chunk_center(chunk)
-          chunk.metadata[:bounds][:min]
-               .zip(chunk.metadata[:bounds][:max])
-               .map { |min, max| (min + max) * 0.5 }
+          def intersects_bounds?(bounds)
+            bounds[:min][0] <= @max_x
+          end
         end
       end
     end

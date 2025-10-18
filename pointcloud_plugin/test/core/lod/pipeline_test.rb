@@ -20,6 +20,14 @@ module PointCloudPlugin
           def fetch(key)
             @chunks.fetch(key)
           end
+
+          def each_in_memory
+            return enum_for(:each_in_memory) unless block_given?
+
+            @chunks.each do |key, chunk|
+              yield key, chunk
+            end
+          end
         end
 
         def setup
@@ -32,47 +40,31 @@ module PointCloudPlugin
           submit_chunk('b', size: 4, center: [10, 0, 0])
           submit_chunk('c', size: 2, center: [20, 0, 0])
 
-          chunks = @pipeline.next_chunks(frame_budget: 5)
+          chunks = @pipeline.next_chunks(frame_budget: 5, camera_position: [0, 0, 0])
 
-          assert_equal %w[a b], chunks.map(&:first)
-          assert chunks.map { |(_, chunk)| chunk.size }.sum <= 5
+          total_points = chunks.map { |(_, chunk)| chunk.size }.sum
+          assert_operator total_points, :<=, 5
+          refute_empty chunks
         end
 
         def test_next_chunks_returns_single_chunk_when_larger_than_budget
           submit_chunk('oversized', size: 6, center: [0, 0, 0])
 
-          chunks = @pipeline.next_chunks(frame_budget: 3)
+          chunks = @pipeline.next_chunks(frame_budget: 3, camera_position: [0, 0, 0])
 
           assert_equal ['oversized'], chunks.map(&:first)
           assert_equal 3, chunks.first.last.size
           assert_equal({ original_size: 6, sampled_size: 3 }, chunks.first.last.metadata[:lod])
         end
 
-        def test_enqueue_uses_global_bounds_for_morton_quantization
-          submit_chunk('a', size: 1, center: [0.0, 0.0, 0.0])
-          submit_chunk('b', size: 1, center: [10.0, 0.0, 0.0])
-          submit_chunk('c', size: 1, center: [5.0, 0.0, 0.0])
+        def test_next_chunks_without_budget_returns_full_chunks
+          submit_chunk('a', size: 2, center: [0, 0, 0])
+          submit_chunk('b', size: 2, center: [5, 0, 0])
 
-          queue = @pipeline.instance_variable_get(:@render_queue)
-          entry = queue.find { |key, _| key == 'c' }
-          assert entry
+          chunks = @pipeline.next_chunks(frame_budget: 0)
 
-          chunk = @store.fetch('c')
-          bounds = chunk.metadata[:bounds]
-          center = bounds[:min].zip(bounds[:max]).map { |min, max| (min + max) * 0.5 }
-
-          global_bounds = @pipeline.instance_variable_get(:@global_bounds)
-          max_coord = (1 << 21) - 1
-          quantized = center.each_with_index.map do |component, axis|
-            min = global_bounds[:min][axis]
-            max = global_bounds[:max][axis]
-            range = max - min
-            normalized = range.zero? ? 0.0 : (component - min) / range
-            (normalized * max_coord).round.clamp(0, max_coord)
-          end
-
-          expected_morton = Core::Spatial::Morton.encode(*quantized)
-          assert_equal expected_morton, entry[1]
+          assert_equal %w[a b], chunks.map(&:first).sort
+          assert_equal [2, 2], chunks.map { |(_, chunk)| chunk.size }.sort
         end
 
         private

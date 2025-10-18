@@ -52,7 +52,7 @@ module PointCloudPlugin
           @chunk_store = Object.new
         end
 
-        def next_chunks(frame_budget: 0)
+        def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil)
           @chunks
         end
       end
