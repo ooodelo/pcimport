@@ -36,7 +36,7 @@ module PointCloudPlugin
 
       def draw(view)
         gather_chunks(view)
-        points = []
+        points_by_color = Hash.new { |hash, key| hash[key] = [] }
 
         @chunk_usage.each do |key|
           entry = @active_chunks[key]
@@ -45,31 +45,32 @@ module PointCloudPlugin
           chunk = entry[:chunk]
           chunk.size.times do |index|
             point = chunk.point_at(index)
-            points << point[:position]
+            points_by_color[group_key_for(point[:color])] << point[:position]
           end
         end
 
         if view.respond_to?(:draw_points)
-          sketchup_points = []
-          points.each do |pos|
-            if pos.is_a?(Geom::Point3d)
-              sketchup_points << pos
-              next
-            end
+          default_color = if defined?(Sketchup::Color)
+                            Sketchup::Color.new(0, 0, 0)
+                          else
+                            'black'
+                          end
 
-            coordinates = pos.respond_to?(:to_a) ? pos.to_a : pos
-            next unless coordinates.is_a?(Array) && coordinates.length >= 3
+          points_by_color.each do |color_key, positions|
+            sketchup_points = convert_positions_to_points(positions)
+            next if sketchup_points.empty?
 
-            sketchup_points << Geom::Point3d.new(*coordinates)
+            color = if color_key == :default
+                      default_color
+                    elsif defined?(Sketchup::Color)
+                      Sketchup::Color.new(*color_key)
+                    else
+                      r, g, b = color_key
+                      format('#%02X%02X%02X', r, g, b)
+                    end
+
+            view.draw_points(sketchup_points, @settings[:point_size], 1, color)
           end
-
-          color = if defined?(Sketchup::Color)
-                    Sketchup::Color.new(0, 0, 0)
-                  else
-                    'black'
-                  end
-
-          view.draw_points(sketchup_points, @settings[:point_size], 1, color) unless sketchup_points.empty?
           draw_snap(view)
           hud.draw(view)
         end
@@ -86,6 +87,26 @@ module PointCloudPlugin
         settings_dialog.on_change do |new_settings|
           @settings = new_settings
         end
+      end
+
+      def convert_positions_to_points(positions)
+        positions.each_with_object([]) do |pos, collection|
+          if pos.is_a?(Geom::Point3d)
+            collection << pos
+            next
+          end
+
+          coordinates = pos.respond_to?(:to_a) ? pos.to_a : pos
+          next unless coordinates.is_a?(Array) && coordinates.length >= 3
+
+          collection << Geom::Point3d.new(*coordinates)
+        end
+      end
+
+      def group_key_for(color)
+        return :default unless color.is_a?(Array) && color.length >= 3
+
+        [color[0], color[1], color[2]].map(&:to_i).freeze
       end
 
       def gather_chunks(view)
