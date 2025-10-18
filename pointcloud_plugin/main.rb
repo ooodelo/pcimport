@@ -4,11 +4,29 @@ require 'tmpdir'
 require 'fileutils'
 
 begin
-  require 'sketchup'
-  require 'extensions'
+  require 'sketchup.rb'
+  require 'extensions.rb'
 rescue LoadError
   # Allow the code to be loaded outside of SketchUp for testing.
 end
+
+module PointCloudPlugin
+  unless respond_to?(:log)
+    def self.log(message)
+      Kernel.puts("[PointCloudPlugin] #{message}")
+    rescue StandardError
+      nil
+    end
+
+    def log(message)
+      PointCloudPlugin.log(message)
+    end
+
+    module_function :log
+  end
+end
+
+PointCloudPlugin.log('Loading runtime (pointcloud_plugin/main.rb)') if defined?(PointCloudPlugin)
 
 require_relative 'core/units'
 require_relative 'core/chunk'
@@ -31,9 +49,9 @@ require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
 
 module PointCloudPlugin
-  EXTENSION_ID = 'com.example.pointcloud'
-  EXTENSION_NAME = 'Point Cloud Importer'
-  EXTENSION_VERSION = '0.1.0'
+  EXTENSION_ID ||= 'com.example.pointcloud'
+  EXTENSION_NAME ||= 'Point Cloud Importer'
+  EXTENSION_VERSION ||= '0.1.0'
 
   module_function
 
@@ -51,6 +69,7 @@ module PointCloudPlugin
     menu = ::UI.menu('File')
     menu.add_item('Import Point Cloud...') { start_import }
     menu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
+    log('Menu items registered')
   end
 
   def start_import
@@ -104,3 +123,4 @@ module PointCloudPlugin
 end
 
 PointCloudPlugin.setup_menu if defined?(::UI)
+PointCloudPlugin.log('Runtime load complete') if defined?(PointCloudPlugin)
