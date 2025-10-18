@@ -27,8 +27,16 @@ module PointCloudPlugin
 
         def next_chunks(frame_budget: @budget)
           @budget = frame_budget
-          pairs = @render_queue.shift(frame_budget) || []
-          pairs.map do |key, _|
+          remaining_points = frame_budget
+          selected_keys = []
+
+          while remaining_points.positive? && (entry = @render_queue.shift)
+            key, _morton, point_count = entry
+            selected_keys << key
+            remaining_points -= point_count
+          end
+
+          selected_keys.map do |key|
             [key, chunk_store.fetch(key)]
           end
         end
@@ -37,8 +45,8 @@ module PointCloudPlugin
           center = chunk.metadata[:bounds][:min].zip(chunk.metadata[:bounds][:max]).map { |min, max| (min + max) * 0.5 }
           quantized = center.map { |value| (value / chunk.scale).to_i }
           morton = Spatial::Morton.encode(*quantized)
-          @render_queue << [key, morton]
-          @render_queue.sort_by!(&:last)
+          @render_queue << [key, morton, chunk.size]
+          @render_queue.sort_by! { |_, value, _| value }
         end
 
         private
