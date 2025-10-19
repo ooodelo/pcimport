@@ -27,6 +27,7 @@ module PointCloudPlugin
         @snap_target = nil
         @frame_times = []
         @last_draw_time = nil
+        @last_drawn_point_count = 0
         hook_settings
       end
 
@@ -39,6 +40,7 @@ module PointCloudPlugin
       end
 
       def draw(view)
+        drawn_points = 0
         begin
           update_fps
           gather_chunks(view)
@@ -73,16 +75,30 @@ module PointCloudPlugin
                 next if sketchup_points.empty?
 
                 view.draw_points(sketchup_points, safe_point_size, 1, color)
+                drawn_points += sketchup_points.length
               end
             end
           end
         rescue => e
           Kernel.puts("[PointCloudPlugin:draw] #{e.class}: #{e.message}\n  #{e.backtrace&.first}")
         ensure
+          @last_drawn_point_count = drawn_points
           draw_snap(view)
           PointCloud::UI::PreviewLayer.draw(view, self) if defined?(PointCloud::UI::PreviewLayer)
           hud.draw(view)
         end
+      end
+
+      def last_drawn_point_count
+        @last_drawn_point_count || 0
+      end
+
+      def reservoir_samples(limit = nil)
+        limit = sanitize_limit(limit)
+        samples = collect_reservoir_samples(limit)
+        return samples unless samples.empty?
+
+        collect_chunk_samples(limit)
       end
 
       def onMouseMove(_flags, x, y, view)
@@ -324,16 +340,7 @@ module PointCloudPlugin
       def update_snap_target(view, x, y)
         return unless view.respond_to?(:pickray)
 
-        samples = []
-        manager.each_cloud do |cloud|
-          reservoir = cloud.pipeline&.reservoir
-          next unless reservoir
-
-          reservoir_samples = reservoir.sample_all
-          next if reservoir_samples.empty?
-
-          samples.concat(reservoir_samples)
-        end
+        samples = reservoir_samples
         return if samples.empty?
 
         origin, direction = view.pickray(x, y)
@@ -399,6 +406,55 @@ module PointCloudPlugin
       def chunk_size_for(key)
         entry = @active_chunks[key]
         entry ? entry[:chunk].size : 0
+      end
+
+      def sanitize_limit(limit)
+        return nil if limit.nil?
+
+        limit = limit.to_i
+        limit.positive? ? limit : nil
+      end
+
+      def collect_reservoir_samples(limit)
+        samples = []
+        manager.each_cloud do |cloud|
+          reservoir = cloud.pipeline&.reservoir
+          next unless reservoir&.respond_to?(:sample_all)
+
+          reservoir_samples = reservoir.sample_all(nil)
+          next if reservoir_samples.empty?
+
+          if limit
+            needed = limit - samples.length
+            break if needed <= 0
+            samples.concat(reservoir_samples.first(needed))
+          else
+            samples.concat(reservoir_samples)
+          end
+        end
+
+        samples
+      end
+
+      def collect_chunk_samples(limit)
+        samples = []
+        manager.each_cloud do |cloud|
+          chunk_store = cloud.pipeline&.chunk_store
+          next unless chunk_store&.respond_to?(:each_in_memory)
+
+          chunk_store.each_in_memory do |_key, chunk|
+            chunk.each_point do |point|
+              samples << point
+              return samples if limit && samples.length >= limit
+            end
+
+            break if limit && samples.length >= limit
+          end
+
+          break if limit && samples.length >= limit
+        end
+
+        samples
       end
     end
   end

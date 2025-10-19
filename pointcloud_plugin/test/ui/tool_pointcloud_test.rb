@@ -47,9 +47,9 @@ module PointCloudPlugin
       class FakePipeline
         attr_reader :chunk_store, :reservoir
 
-        def initialize(chunks, reservoir: nil)
+        def initialize(chunks, reservoir: nil, chunk_store: nil)
           @chunks = chunks
-          @chunk_store = Object.new
+          @chunk_store = chunk_store || Object.new
           @reservoir = reservoir || EmptyReservoir.new
         end
 
@@ -60,6 +60,20 @@ module PointCloudPlugin
         class EmptyReservoir
           def sample_all(_limit = nil)
             []
+          end
+        end
+      end
+
+      class FakeChunkStore
+        def initialize(entries)
+          @entries = entries
+        end
+
+        def each_in_memory
+          return enum_for(:each_in_memory) unless block_given?
+
+          @entries.each do |entry|
+            yield entry[:key], entry[:chunk]
           end
         end
       end
@@ -139,6 +153,59 @@ module PointCloudPlugin
         tool.send(:update_snap_target, view, 0, 0)
 
         assert_equal sample_point, tool.instance_variable_get(:@snap_target)
+      end
+
+      def test_reservoir_samples_respects_limit
+        samples = [
+          { position: [0.0, 0.0, 0.0] },
+          { position: [1.0, 0.0, 0.0] }
+        ]
+
+        reservoir = Class.new do
+          def initialize(samples)
+            @samples = samples
+          end
+
+          def sample_all(_limit = nil)
+            @samples
+          end
+        end.new(samples)
+
+        pipeline = FakePipeline.new([], reservoir: reservoir)
+        cloud = FakeCloud.new(1, pipeline, Object.new)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+
+        assert_equal [samples.first], tool.reservoir_samples(1)
+      end
+
+      def test_reservoir_samples_falls_back_to_chunks
+        chunk_points = [
+          { position: [0.0, 0.0, 0.0] },
+          { position: [1.0, 1.0, 1.0] }
+        ]
+
+        chunk = Class.new do
+          def initialize(points)
+            @points = points
+          end
+
+          def each_point
+            return enum_for(:each_point) unless block_given?
+
+            @points.each { |point| yield point }
+          end
+        end.new(chunk_points)
+
+        chunk_store = FakeChunkStore.new([{ key: 'chunk', chunk: chunk }])
+        pipeline = FakePipeline.new([], chunk_store: chunk_store)
+        cloud = FakeCloud.new(1, pipeline, Object.new)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+
+        assert_equal [chunk_points.first], tool.reservoir_samples(1)
       end
 
       private
