@@ -53,7 +53,14 @@ module PointCloudPlugin
         @on_manager_visibility_change = nil
         @cache_hit = false
         @latest_error_info = nil
-        @latest_timings = { total: 0.0, stages: {} }
+        @latest_timings = {
+          total: 0.0,
+          total_points: 0,
+          cache_hit: false,
+          status: nil,
+          stages: default_stage_timings,
+          metadata: {}
+        }
 
         if html_dialog_available?
           refresh_cached_clouds
@@ -320,6 +327,9 @@ module PointCloudPlugin
                 .status-row { display: flex; justify-content: space-between; font-size: 12px; }
                 .status-row .label { color: #657085; font-weight: 600; }
                 .status-row .value { color: #2f3b4c; }
+                .status-row .value.cache-hit { color: #2f8f4b; font-weight: 600; }
+                .status-row .value.cache-miss { color: #d64541; font-weight: 600; }
+                .status-row .value.pending { color: #7a8596; }
                 .status-row.error .value { color: #d64541; }
                 .status-row.hidden { display: none; }
                 dl { margin: 0; }
@@ -394,8 +404,10 @@ module PointCloudPlugin
                     hash_check: 'Проверка',
                     sampling: 'Выборка',
                     cache_write: 'Запись кэша',
-                    build: 'Построение'
+                    build: 'Построение',
+                    preview_build: 'Предпросмотр'
                   };
+                  const TIMING_SEQUENCE = ['hash_check', 'sampling', 'cache_write', 'build', 'preview_build'];
 
                   let previewCapabilities = { sample: false, anchors: false };
                   let suppressVisibilityEvent = false;
@@ -510,7 +522,10 @@ module PointCloudPlugin
                   function renderStatuses(payload) {
                     const stageKey = (payload && payload.stage) ? payload.stage.toString() : '';
                     statusStage.textContent = STAGE_LABELS[stageKey] || '—';
-                    statusCache.textContent = payload && payload.cacheHit ? 'Кэш' : 'Новый импорт';
+                    const cacheHit = !!(payload && (payload.cacheHit || payload.cache_hit));
+                    statusCache.classList.remove('cache-hit', 'cache-miss');
+                    statusCache.classList.add(cacheHit ? 'cache-hit' : 'cache-miss');
+                    statusCache.textContent = cacheHit ? 'Кэш обновлён' : 'Новый импорт';
                     const sampleReady = !!(payload && payload.sampleReady);
                     const anchorsReady = !!(payload && payload.anchorsReady);
                     statusSample.textContent = sampleReady ? 'Готово' : 'Готовится…';
@@ -521,7 +536,10 @@ module PointCloudPlugin
                     } else {
                       statusAnchors.textContent = 'Недоступно';
                     }
-                    statusTimings.textContent = formatTimings(payload && payload.timings);
+                    const completionStatus = readCompletionStatus(payload);
+                    const completed = completionStatus === 'completed';
+                    statusTimings.classList.toggle('pending', !completed);
+                    statusTimings.textContent = completed ? formatTimings(payload && payload.timings, { cacheHit: cacheHit }) : 'Ожидание…';
                     const errorInfo = payload && payload.error;
                     if (errorInfo && errorInfo.message) {
                       statusError.textContent = errorInfo.message;
@@ -533,30 +551,51 @@ module PointCloudPlugin
                     }
                   }
 
-                  function readTiming(stages, key) {
+                  function readCompletionStatus(payload) {
+                    if (!payload) { return ''; }
+                    const raw = payload.completionStatus || payload.completion_status;
+                    return raw ? raw.toString() : '';
+                  }
+
+                  function readStageEntry(stages, key) {
                     if (!stages || typeof stages !== 'object') { return null; }
-                    if (Object.prototype.hasOwnProperty.call(stages, key)) {
-                      return stages[key];
+                    const raw = stages[key] || stages[key.toString()];
+                    if (raw === undefined || raw === null) { return null; }
+                    if (typeof raw === 'number') {
+                      return { duration: raw, points: 0 };
                     }
-                    const stringKey = key.toString();
-                    if (Object.prototype.hasOwnProperty.call(stages, stringKey)) {
-                      return stages[stringKey];
+                    if (typeof raw === 'object') {
+                      const duration = Number(raw.duration || raw.total || raw.total_duration || 0);
+                      const points = Number(raw.points || raw.point_count || 0);
+                      return { duration: duration, points: points };
                     }
                     return null;
                   }
 
-                  function formatTimings(timings) {
+                  function formatTimings(timings, options) {
                     if (!timings || typeof timings !== 'object') { return '—'; }
-                    const total = formatDuration(timings.total);
                     const parts = [];
-                    if (total) { parts.push('Всего ' + total); }
-                    const stages = timings.stages;
-                    ['hash_check', 'sampling', 'cache_write', 'build'].forEach(key => {
-                      const duration = formatDuration(readTiming(stages, key));
-                      if (duration) {
-                        const label = TIMING_LABELS[key] || key;
-                        parts.push(label + ': ' + duration);
-                      }
+                    const total = formatDuration(timings.total || timings.total_duration);
+                    const totalPoints = formatPoints(timings.total_points);
+                    const cacheHit = options && options.cacheHit;
+                    if (total) {
+                      const label = cacheHit ? 'Кэш' : 'Импорт';
+                      let headline = label + ': ' + total;
+                      if (totalPoints) { headline += ' (' + totalPoints + ')'; }
+                      parts.push(headline);
+                    } else if (totalPoints) {
+                      parts.push(totalPoints);
+                    }
+                    const stages = timings.stages || {};
+                    TIMING_SEQUENCE.forEach(key => {
+                      const entry = readStageEntry(stages, key);
+                      if (!entry) { return; }
+                      const duration = formatDuration(entry.duration);
+                      if (!duration) { return; }
+                      let label = TIMING_LABELS[key] || key;
+                      const pointsLabel = formatPoints(entry.points);
+                      if (pointsLabel) { label += ' (' + pointsLabel + ')'; }
+                      parts.push(label + ': ' + duration);
                     });
                     return parts.length ? parts.join(', ') : '—';
                   }
@@ -581,6 +620,20 @@ module PointCloudPlugin
                     }
                     const secondLabel = remaining > 0 ? ' ' + remaining + ' с' : '';
                     return minutes + ' мин' + secondLabel;
+                  }
+
+                  function formatPoints(value) {
+                    const points = Number(value);
+                    if (!isFinite(points) || points <= 0) { return ''; }
+                    if (points >= 1000000) {
+                      const millions = points / 1000000;
+                      return (millions >= 10 ? Math.round(millions) : millions.toFixed(1).replace(/\.0$/, '')) + ' млн точек';
+                    }
+                    if (points >= 1000) {
+                      const thousands = points / 1000;
+                      return (thousands >= 10 ? Math.round(thousands) : thousands.toFixed(1).replace(/\.0$/, '')) + ' тыс. точек';
+                    }
+                    return points.toLocaleString('ru-RU') + ' точек';
                   }
 
                   cancelButton.addEventListener('click', () => {
@@ -688,6 +741,7 @@ module PointCloudPlugin
           steps: build_step_entries,
           stage: state,
           cacheHit: @cache_hit,
+          completionStatus: @completion_status,
           sampleReady: !!@preview_available,
           anchorsReady: !!@anchors_available,
           timings: @latest_timings,
@@ -828,6 +882,16 @@ module PointCloudPlugin
         }
       end
 
+      def default_stage_timings
+        default_stage_progress.keys.each_with_object({}) do |stage, memo|
+          memo[stage] = blank_stage_entry
+        end
+      end
+
+      def blank_stage_entry
+        { duration: 0.0, points: 0, segments: [] }
+      end
+
       def build_visibility_state(settings)
         {
           points: !!settings&.dig(:preview_show_points),
@@ -865,24 +929,136 @@ module PointCloudPlugin
       end
 
       def normalize_timings(value)
-        data = value.is_a?(Hash) ? value : {}
-        symbolized = safe_hash(data)
+        data = safe_hash(value)
 
-        total_value = symbolized[:total] || symbolized['total']
-        total = normalize_float(total_value)
+        total = normalize_float(data[:total] || data['total'])
+        total_points = normalize_integer(data[:total_points] || data['total_points'])
+        cache_hit = normalize_optional_boolean(data[:cache_hit] || data['cache_hit'])
+        status = normalize_string(data[:status] || data['status'])
+        started_at = normalize_timestamp(data[:started_at] || data['started_at'])
+        finished_at = normalize_timestamp(data[:finished_at] || data['finished_at'])
+        generated_at = normalize_timestamp(data[:generated_at] || data['generated_at'])
 
-        stages_source = symbolized[:stages] || symbolized['stages'] || {}
-        stages_hash = safe_hash(stages_source).each_with_object({}) do |(stage, raw), memo|
-          memo[stage.to_sym] = normalize_float(raw)
+        stages_source = data[:stages] || data['stages'] || {}
+        stages_hash = default_stage_timings.transform_values { blank_stage_entry }
+
+        safe_hash(stages_source).each do |stage, raw|
+          stages_hash[stage.to_sym] = normalize_stage_entry(raw)
         end
 
-        default_stage_progress.keys.each do |stage|
-          stages_hash[stage] = normalize_float(stages_hash[stage])
+        preview_stage = :preview_build
+        unless stages_hash.key?(preview_stage)
+          raw = stages_source[preview_stage] || stages_source[preview_stage.to_s]
+          stages_hash[preview_stage] = normalize_stage_entry(raw)
         end
 
-        { total: total, stages: stages_hash }
+        {
+          total: total,
+          total_points: total_points,
+          cache_hit: cache_hit.nil? ? false : cache_hit,
+          status: status,
+          started_at: started_at,
+          finished_at: finished_at,
+          generated_at: generated_at,
+          stages: stages_hash,
+          metadata: normalize_metadata(data[:metadata] || data['metadata'])
+        }
       rescue StandardError
-        { total: 0.0, stages: default_stage_progress.transform_values { 0.0 } }
+        {
+          total: 0.0,
+          total_points: 0,
+          cache_hit: false,
+          status: nil,
+          started_at: nil,
+          finished_at: nil,
+          generated_at: nil,
+          stages: default_stage_timings.merge(preview_build: blank_stage_entry),
+          metadata: {}
+        }
+      end
+
+      def normalize_stage_entry(raw)
+        case raw
+        when Hash
+          hash = safe_hash(raw)
+          duration = normalize_float(hash[:duration] || hash['duration'] || hash[:total] || hash['total'])
+          points = normalize_integer(hash[:points] || hash['points'])
+          segments = normalize_segments(hash[:segments] || hash['segments'])
+          { duration: duration, points: points, segments: segments }
+        when Numeric
+          { duration: normalize_float(raw), points: 0, segments: [] }
+        else
+          blank_stage_entry
+        end
+      rescue StandardError
+        blank_stage_entry
+      end
+
+      def normalize_segments(value)
+        Array(value).each_with_object([]) do |segment, memo|
+          next unless segment.is_a?(Hash)
+
+          hash = safe_hash(segment)
+          normalized = {
+            started_at: normalize_timestamp(hash[:started_at] || hash['started_at']),
+            finished_at: normalize_timestamp(hash[:finished_at] || hash['finished_at']),
+            duration: normalize_float(hash[:duration] || hash['duration']),
+            points: normalize_integer(hash[:points] || hash['points'])
+          }
+          metadata = normalize_metadata(hash[:metadata] || hash['metadata'])
+          normalized[:metadata] = metadata if metadata.any?
+          memo << normalized
+        end
+      rescue StandardError
+        []
+      end
+
+      def normalize_timestamp(value)
+        return nil if value.nil?
+
+        string = value.to_s.strip
+        string.empty? ? nil : string
+      rescue StandardError
+        nil
+      end
+
+      def normalize_integer(value)
+        return 0 if value.nil?
+
+        Integer(value)
+      rescue ArgumentError, TypeError
+        0
+      end
+
+      def normalize_optional_boolean(value)
+        case value
+        when nil then nil
+        when true, 'true', '1', 1 then true
+        when false, 'false', '0', 0 then false
+        else
+          !!value
+        end
+      rescue StandardError
+        nil
+      end
+
+      def normalize_string(value)
+        return nil if value.nil?
+
+        string = value.to_s.strip
+        string.empty? ? nil : string
+      rescue StandardError
+        nil
+      end
+
+      def normalize_metadata(value)
+        return {} unless value.is_a?(Hash)
+
+        value.each_with_object({}) do |(key, raw), memo|
+          memo[key.to_sym] = raw
+        end
+      rescue StandardError
+        {}
       end
 
       def normalize_error(value)
