@@ -5,6 +5,7 @@ require_relative '../core/chunk'
 require_relative '../core/chunk_store'
 require_relative '../core/file_hasher'
 require_relative '../core/lod/pipeline'
+require_relative '../core/sampling/voxel_reservoir_sampler'
 require_relative 'main_thread_queue'
 
 module PointCloudPlugin
@@ -13,6 +14,11 @@ module PointCloudPlugin
     class ImportJob
       DEFAULT_PREVIEW_THRESHOLD = 0.12
       STREAMING_COMPATIBILITY_FLAG = 'PCIMPORT_STREAMING_COMPAT'
+      SAMPLE_FILE_NAME = 'sample_300k.bin'
+      SAMPLE_MAGIC = 'PCS1'.b
+      SAMPLE_VERSION = 1
+      SAMPLE_FLAG_HAS_COLOR = 0x01
+      SAMPLE_FLAG_HAS_ANCHOR = 0x02
 
       attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
       attr_accessor :cloud_id
@@ -97,12 +103,14 @@ module PointCloudPlugin
         manifest.update_source_signature!(signature) if manifest && signature
 
         total_points = 0
+        sampler = Core::Sampling::VoxelReservoirSampler.new(target_count: 300_000, anchor_ratio: 0.01)
         preview_accumulator = []
         transition_state(:sampling)
 
         reader.each_batch do |batch|
           break if cancelled?
 
+          sampler.add_batch(batch)
           preview_points = preview_sample(batch)
           append_preview_samples(preview_accumulator, preview_points)
 
@@ -164,6 +172,7 @@ module PointCloudPlugin
           return
         end
 
+        write_sample_300k(sampler)
         write_preview_sample(preview_accumulator)
 
         transition_state(:build)
@@ -343,6 +352,71 @@ module PointCloudPlugin
         samples
       rescue StandardError
         []
+      end
+
+      def write_sample_300k(sampler)
+        return unless sampler
+
+        samples = sampler.samples
+        return if samples.empty?
+
+        store = pipeline&.chunk_store
+        cache_path = store&.cache_path
+        return unless cache_path
+
+        require 'fileutils'
+
+        FileUtils.mkdir_p(cache_path)
+
+        has_color = samples.any? { |sample| sample.color && sample.color.compact.any? }
+        has_anchor = samples.any?(&:anchor)
+
+        flags = 0
+        flags |= SAMPLE_FLAG_HAS_COLOR if has_color
+        flags |= SAMPLE_FLAG_HAS_ANCHOR if has_anchor
+
+        header = [
+          SAMPLE_MAGIC,
+          SAMPLE_VERSION,
+          samples.length,
+          flags
+        ].pack('a4 S< L< L<')
+
+        payload = String.new(encoding: Encoding::BINARY)
+
+        samples.each do |sample|
+          position = Array(sample.position).first(3)
+          coords = position.map { |value| value ? value.to_f : 0.0 }
+          coords.fill(0.0, coords.length...3)
+          payload << coords.pack('e3')
+
+          if has_color
+            color = sample.color || []
+            rgb = color.first(3).map do |component|
+              begin
+                Integer(component)
+              rescue ArgumentError, TypeError
+                component ? component.to_f.round : 0
+              end
+            end
+            rgb.fill(0, rgb.length...3)
+            payload << rgb.map { |value| value.to_i & 0xFF }.pack('C3')
+          end
+
+          payload << [sample.anchor ? 1 : 0].pack('C')
+        end
+
+        path = File.join(cache_path, SAMPLE_FILE_NAME)
+        File.binwrite(path, header + payload)
+
+        if (manifest = store&.manifest)
+          anchors = manifest.anchors
+          anchors['has_custom_anchors'] = has_anchor
+          manifest.anchors = anchors
+          manifest.write!
+        end
+      rescue StandardError => e
+        warn("Failed to write #{SAMPLE_FILE_NAME}: #{e.message}")
       end
 
       def write_preview_sample(points)
