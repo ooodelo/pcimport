@@ -16,13 +16,18 @@ module PointCloudPlugin
         @entries = {}
         @lru = []
         @on_remove_callbacks = []
+        @bytes_in_ram = 0
+        @memory_limit_bytes = 512 * 1024 * 1024
         FileUtils.mkdir_p(cache_path)
       end
 
       def store(key, chunk)
+        previous = @entries[key]
+        @bytes_in_ram -= previous.byte_size if previous
         @entries[key] = chunk
+        @bytes_in_ram += chunk.byte_size
         touch(key)
-        evict! if @lru.size > max_in_memory
+        evict_until_limit
         persist_to_disk(key, chunk)
       end
 
@@ -37,8 +42,9 @@ module PointCloudPlugin
 
         chunk = Marshal.load(File.binread(path))
         @entries[key] = chunk
+        @bytes_in_ram += chunk.byte_size
         touch(key)
-        evict! if @lru.size > max_in_memory
+        evict_until_limit
         chunk
       end
 
@@ -61,10 +67,12 @@ module PointCloudPlugin
         end
         @entries.clear
         @lru.clear
+        @bytes_in_ram = 0
       end
 
       def release(key)
-        @entries.delete(key)
+        chunk = @entries.delete(key)
+        @bytes_in_ram -= chunk.byte_size if chunk
         @lru.delete(key)
         notify_removed(key)
       end
@@ -73,6 +81,11 @@ module PointCloudPlugin
         return unless block
 
         @on_remove_callbacks << block
+      end
+
+      def memory_limit_mb=(mb)
+        @memory_limit_bytes = (mb.to_i * 1024 * 1024)
+        evict_until_limit
       end
 
       private
@@ -90,10 +103,11 @@ module PointCloudPlugin
         @lru.unshift(key)
       end
 
-      def evict!
-        while @lru.size > max_in_memory
+      def evict_until_limit
+        while @bytes_in_ram > @memory_limit_bytes && @lru.any?
           key = @lru.pop
-          @entries.delete(key)
+          chunk = @entries.delete(key)
+          @bytes_in_ram -= chunk.byte_size if chunk
           notify_removed(key)
         end
       end
