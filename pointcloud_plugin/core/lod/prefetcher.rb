@@ -12,9 +12,11 @@ module PointCloudPlugin
         HISTORY_LIMIT = 5
         PREDICTION_HORIZON = 0.5
         DEFAULT_PREFETCH_LIMIT = 32
-        ANGLE_WEIGHT = 10.0
-        DISTANCE_WEIGHT = 1.0
-        FORWARD_COSINE_THRESHOLD = 0.0
+        DEFAULT_ANGLE_WEIGHT = 10.0
+        DEFAULT_DISTANCE_WEIGHT = 1.0
+        DEFAULT_FORWARD_COSINE_THRESHOLD = 0.0
+
+        attr_reader :max_prefetch, :angle_weight, :distance_weight, :forward_cosine_threshold
 
         def initialize(chunk_store, index_builder: nil)
           @chunk_store = chunk_store
@@ -22,6 +24,10 @@ module PointCloudPlugin
           @camera_history = []
           @known_chunks = {}
           @index_dirty = true
+          @max_prefetch = DEFAULT_PREFETCH_LIMIT
+          @angle_weight = DEFAULT_ANGLE_WEIGHT
+          @distance_weight = DEFAULT_DISTANCE_WEIGHT
+          @forward_cosine_threshold = DEFAULT_FORWARD_COSINE_THRESHOLD
         end
 
         def prefetch_for_view(
@@ -31,8 +37,9 @@ module PointCloudPlugin
           camera_direction: nil,
           view: nil,
           timestamp: nil,
-          max_prefetch: DEFAULT_PREFETCH_LIMIT
+          max_prefetch: nil
         )
+          max_prefetch ||= @max_prefetch
           timestamp ||= current_time
           track_camera_movement(camera_position, timestamp) if camera_position
 
@@ -69,6 +76,16 @@ module PointCloudPlugin
           keys = keys.first(limit) if limit
 
           @chunk_store.prefetch(keys) if keys.any?
+        end
+
+        def configure(max_prefetch: nil, angle_weight: nil, distance_weight: nil, forward_threshold: nil)
+          @max_prefetch = [max_prefetch.to_i, 0].max if max_prefetch
+          @angle_weight = angle_weight.to_f if angle_weight
+          @distance_weight = distance_weight.to_f if distance_weight
+          if forward_threshold
+            value = forward_threshold.to_f
+            @forward_cosine_threshold = value.clamp(-1.0, 1.0)
+          end
         end
 
         private
@@ -308,13 +325,13 @@ module PointCloudPlugin
           return false unless camera_forward && camera_position
           return false if cosine.nil?
 
-          cosine >= FORWARD_COSINE_THRESHOLD
+          cosine >= @forward_cosine_threshold
         end
 
         def priority_score(cosine, distance, near_visible)
           angle_penalty = 1.0 - (cosine || 0.0)
           distance_penalty = distance || Float::INFINITY
-          score = angle_penalty * ANGLE_WEIGHT + distance_penalty * DISTANCE_WEIGHT
+          score = angle_penalty * @angle_weight + distance_penalty * @distance_weight
           near_visible ? score * 0.1 : score
         end
 

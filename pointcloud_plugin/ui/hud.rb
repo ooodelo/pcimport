@@ -31,7 +31,7 @@ module PointCloudPlugin
 
       private
 
-      PRIORITY_KEYS = %w[fps load_status load_speed points_on_screen memory_notice].freeze
+      PRIORITY_KEYS = %w[mode target_budget target_point_size fps load_status load_speed points_on_screen memory_notice].freeze
 
       def format_metrics
         PRIORITY_KEYS.filter_map do |key|
@@ -43,7 +43,13 @@ module PointCloudPlugin
       end
 
       def humanize_key(key)
-        key.to_s.split('_').map(&:capitalize).join(' ')
+        case key.to_s
+        when 'mode' then 'Режим'
+        when 'target_budget' then 'Целевой бюджет'
+        when 'target_point_size' then 'Размер точки'
+        else
+          key.to_s.split('_').map(&:capitalize).join(' ')
+        end
       end
 
       def format_value(value)

@@ -57,14 +57,16 @@ module PointCloudPlugin
           @visible_calls = []
         end
 
-        def prefetch_for_view(visible_chunks, budget: 0, camera_position: nil)
+        def prefetch_for_view(visible_chunks, budget: 0, camera_position: nil, max_prefetch: nil)
           @visible_calls << visible_chunks
           @last_budget = budget
           @last_camera_position = camera_position
+          @last_max_prefetch = max_prefetch
         end
 
         attr_reader :last_budget
         attr_reader :last_camera_position
+        attr_reader :last_max_prefetch
       end
 
       class FakePipeline
@@ -210,6 +212,7 @@ module PointCloudPlugin
         refute_empty tool.instance_variable_get(:@active_chunks)
         assert_equal visible_chunk, tool.instance_variable_get(:@active_chunks)['chunk'][:chunk]
         assert_equal [{ key: 'chunk', bounds: visible_chunk.metadata[:bounds] }], prefetcher.visible_calls.first
+        assert_equal tool.instance_variable_get(:@settings)[:prefetch_limit], prefetcher.last_max_prefetch
       end
 
       def test_update_snap_target_uses_reservoir_samples

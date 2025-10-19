@@ -32,6 +32,11 @@ module PointCloudPlugin
 
       attr_reader :manager, :hud, :settings_dialog, :import_overlay
 
+      MODE_LABELS = {
+        navigation: 'Наведение',
+        detail: 'Детализация'
+      }.freeze
+
       def initialize(manager)
         @manager = manager
         @hud = Hud.new
@@ -308,7 +313,7 @@ module PointCloudPlugin
       def format_memory_notice(limit_bytes, freed_bytes)
         limit_mb = limit_bytes ? (limit_bytes.to_f / (1024.0 * 1024.0)).round : 0
         freed_mb = freed_bytes.to_f / (1024.0 * 1024.0)
-        format('Ограничили память до %d МБ, освобождено %.1f МБ', limit_mb, freed_mb)
+        format('Ограничение по памяти: снизьте бюджет или увеличьте лимит — предел %d МБ, освобождено %.1f МБ', limit_mb, freed_mb)
       end
 
       def current_time
@@ -389,8 +394,57 @@ module PointCloudPlugin
 
       def hook_settings
         settings_dialog.on_change do |new_settings|
+          previous = @settings
           @settings = new_settings
+          handle_settings_change(previous, new_settings)
         end
+        handle_settings_change(nil, @settings)
+      end
+
+      def handle_settings_change(_previous_settings, current_settings)
+        return unless current_settings
+
+        update_hud_runtime_metrics(current_settings)
+      end
+
+      def update_hud_runtime_metrics(settings)
+        return unless hud
+
+        hud.update(
+          mode: hud_mode_value(settings),
+          target_budget: hud_budget_value(settings[:budget]),
+          target_point_size: hud_point_size_value(settings[:point_size])
+        )
+      end
+
+      def hud_mode_value(settings)
+        mode = settings[:mode]
+        symbol = mode.respond_to?(:to_sym) ? mode.to_sym : nil
+        label = MODE_LABELS[symbol] || mode.to_s
+        label = label.to_s
+        label = '—' if label.empty?
+        settings[:preset_customized] ? "#{label} · ручн." : label
+      rescue StandardError
+        mode.to_s
+      end
+
+      def hud_budget_value(budget)
+        value = budget.to_i
+        return '—' if value <= 0
+
+        if value >= 1_000_000
+          format('%.1fM точек', value / 1_000_000.0)
+        elsif value >= 1_000
+          format('%.1fK точек', value / 1_000.0)
+        else
+          format('%d точек', value)
+        end
+      end
+
+      def hud_point_size_value(size)
+        value = size.to_i
+        value = 1 if value <= 0
+        format('%d px', value)
       end
 
       def gather_reservoir_samples(limit)
@@ -545,7 +599,8 @@ module PointCloudPlugin
           cloud.prefetcher.prefetch_for_view(
             visible_entries,
             budget: @settings[:budget],
-            camera_position: camera_position
+            camera_position: camera_position,
+            max_prefetch: @settings[:prefetch_limit]
           )
           cloud.pipeline.next_chunks(
             frame_budget: @settings[:budget],
