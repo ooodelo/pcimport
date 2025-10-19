@@ -118,12 +118,9 @@ module PointCloudPlugin
     cache_root = File.join(Dir.tmpdir, 'pointcloud_cache')
     FileUtils.mkdir_p(cache_root)
     cache_path = File.join(cache_root, File.basename(path, '.*'))
-    chunk_store = Core::ChunkStore.new(cache_path: cache_path)
     runtime_settings = tool.settings_dialog.settings || {}
     memory_limit = runtime_settings[:memory_limit]
-    if memory_limit && chunk_store.respond_to?(:memory_limit_mb=)
-      chunk_store.memory_limit_mb = memory_limit
-    end
+    chunk_store = Core::ChunkStore.new(cache_path: cache_path, memory_limit_mb: memory_limit)
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
     job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
 
