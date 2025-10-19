@@ -21,6 +21,29 @@ module PointCloudPlugin
         positions[:x].size
       end
 
+      def count
+        size
+      end
+
+      def has_rgb?
+        return false unless colors
+
+        %i[r g b].all? { |channel| colors[channel]&.compact&.any? }
+      end
+
+      def has_intensity?
+        intensities&.compact&.any?
+      end
+
+      def byte_size
+        per_point = 6
+        per_point += 3 if has_rgb?
+        per_point += 2 if has_intensity?
+        header = 64
+
+        header + per_point * count
+      end
+
       def each_point
         return enum_for(:each_point) unless block_given?
 
