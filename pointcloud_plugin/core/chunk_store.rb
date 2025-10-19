@@ -2,6 +2,8 @@
 
 require 'fileutils'
 
+require_relative 'chunk_serializer'
+
 module PointCloudPlugin
   module Core
     # Stores chunks in memory and persists them to disk using an LRU policy.
@@ -12,7 +14,7 @@ module PointCloudPlugin
 
       DEFAULT_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
-      def initialize(cache_path:, max_in_memory: 32, memory_limit_mb: nil)
+      def initialize(cache_path:, max_in_memory: 32, memory_limit_mb: nil, manifest: nil)
         @cache_path = cache_path
         @max_in_memory = max_in_memory
         @entries = {}
@@ -22,6 +24,8 @@ module PointCloudPlugin
         @memory_limit_bytes = normalize_memory_limit(memory_limit_mb)
         @memory_pressure_callbacks = []
         @memory_pressure_notified = false
+        @serializer = ChunkSerializer.new
+        @manifest = manifest
         FileUtils.mkdir_p(cache_path)
       end
 
@@ -43,10 +47,9 @@ module PointCloudPlugin
           return entry.chunk
         end
 
-        path = chunk_path(key)
-        return unless File.exist?(path)
+        chunk = load_chunk(key)
+        return unless chunk
 
-        chunk = Marshal.load(File.binread(path))
         entry = Entry.new(key, chunk, chunk.memory_bytes)
         @entries[key] = entry
         @bytes_in_ram += entry.bytes
@@ -56,7 +59,7 @@ module PointCloudPlugin
       end
 
       def prefetch(keys)
-        keys.each { |key| fetch(key) }
+        keys.each { |k| fetch(k) }
       end
 
       def each_in_memory
@@ -105,6 +108,8 @@ module PointCloudPlugin
 
       private
 
+      attr_reader :serializer, :manifest
+
       def normalize_memory_limit(mb)
         return DEFAULT_MEMORY_LIMIT_BYTES if mb.nil?
 
@@ -113,10 +118,19 @@ module PointCloudPlugin
       end
 
       def persist_to_disk(key, chunk)
-        File.binwrite(chunk_path(key), Marshal.dump(chunk))
+        path = chunk_path(key)
+        serializer.write(path, chunk)
+        register_chunk_file(File.basename(path))
+      rescue StandardError
+        FileUtils.rm_f(path)
+        raise
       end
 
       def chunk_path(key)
+        File.join(cache_path, "#{key}.pccb")
+      end
+
+      def legacy_chunk_path(key)
         File.join(cache_path, "#{key}.chunk")
       end
 
@@ -138,6 +152,75 @@ module PointCloudPlugin
         end
 
         notify_memory_pressure(freed_bytes) if freed_bytes.positive?
+      end
+
+      def load_chunk(key)
+        chunk = ensure_current_format(key)
+        return chunk if chunk
+
+        serializer.read(chunk_path(key))
+      rescue ChunkSerializer::CorruptedData, ChunkSerializer::InvalidHeader
+        handle_corrupted_chunk(key)
+      rescue Errno::ENOENT
+        nil
+      end
+
+      def ensure_current_format(key)
+        path = chunk_path(key)
+        return nil if File.exist?(path)
+
+        legacy_path = legacy_chunk_path(key)
+        return nil unless File.exist?(legacy_path)
+
+        chunk = Marshal.load(File.binread(legacy_path))
+        persist_to_disk(key, chunk)
+        FileUtils.rm_f(legacy_path)
+        remove_chunk_file(File.basename(legacy_path))
+        chunk
+      rescue StandardError
+        FileUtils.rm_f(legacy_path) if legacy_path && File.exist?(legacy_path)
+        nil
+      end
+
+      def handle_corrupted_chunk(key)
+        path = chunk_path(key)
+        FileUtils.rm_f(path)
+        remove_chunk_file(File.basename(path))
+        ensure_current_format(key)
+      rescue StandardError
+        nil
+      end
+
+      def register_chunk_file(filename)
+        return unless manifest
+
+        if manifest.respond_to?(:chunks=)
+          current = Array(manifest.chunks) - [filename]
+          current << filename
+          manifest.chunks = current
+        end
+
+        if manifest.respond_to?(:chunk_format_version=)
+          manifest.chunk_format_version = ChunkSerializer::VERSION
+        elsif manifest.respond_to?(:version=)
+          manifest.version = ChunkSerializer::VERSION
+        end
+
+        manifest.write! if manifest.respond_to?(:write!)
+      rescue StandardError
+        nil
+      end
+
+      def remove_chunk_file(filename)
+        return unless manifest
+
+        if manifest.respond_to?(:chunks=)
+          manifest.chunks = Array(manifest.chunks) - [filename]
+        end
+
+        manifest.write! if manifest.respond_to?(:write!)
+      rescue StandardError
+        nil
       end
 
       def notify_removed(key)

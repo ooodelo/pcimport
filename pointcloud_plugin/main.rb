@@ -195,7 +195,7 @@ module PointCloudPlugin
 
     runtime_settings = tool.settings_dialog.settings || {}
     memory_limit = runtime_settings[:memory_limit]
-    chunk_store = Core::ChunkStore.new(cache_path: cache_path, memory_limit_mb: memory_limit)
+    chunk_store = Core::ChunkStore.new(cache_path: cache_path, memory_limit_mb: memory_limit, manifest: manifest)
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
     job = nil
 

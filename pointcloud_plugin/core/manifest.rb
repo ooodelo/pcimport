@@ -4,6 +4,8 @@ require 'json'
 require 'digest'
 require 'fileutils'
 
+require_relative 'chunk_serializer'
+
 module PointCloudPlugin
   module Core
     # Encapsulates manifest metadata that describes a cached point cloud.
@@ -112,6 +114,22 @@ module PointCloudPlugin
         chunks << filename.to_s unless chunks.include?(filename.to_s)
       end
 
+      def version
+        @data['version']
+      end
+
+      def version=(value)
+        @data['version'] = value
+      end
+
+      def chunk_format_version
+        @data['chunk_format_version']
+      end
+
+      def chunk_format_version=(value)
+        @data['chunk_format_version'] = value
+      end
+
       def preview_file
         @data['preview_file']
       end
@@ -135,8 +153,13 @@ module PointCloudPlugin
 
       # Ensures the manifest knows which chunks exist in the cache directory.
       def ensure_chunk_inventory!
-        glob = Dir.glob(File.join(cache_path, '*.chunk'))
-        self.chunks = glob.map { |file| File.basename(file) }
+        glob = Dir.glob(File.join(cache_path, '*.pccb'))
+        legacy = Dir.glob(File.join(cache_path, '*.chunk'))
+        files = (glob + legacy).map { |file| File.basename(file) }
+        self.chunks = files.sort
+        if glob.any?
+          self.chunk_format_version = ChunkSerializer::VERSION
+        end
       rescue StandardError
         nil
       end
@@ -146,6 +169,7 @@ module PointCloudPlugin
       def default_manifest
         {
           'version' => 1,
+          'chunk_format_version' => ChunkSerializer::VERSION,
           'project_path' => nil,
           'source' => nil,
           'chunks' => [],
