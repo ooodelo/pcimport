@@ -79,17 +79,21 @@ module PointCloudPlugin
 
     return if @menu_created
 
-    MENU_PARENT_LABELS.each do |parent_label|
-      parent_menu = menu_for(parent_label)
-      next unless parent_menu
+    # Try 'Extensions' first, fall back to 'Plugins' if not available
+    parent_label = MENU_PARENT_LABELS.find { |label| menu_for(label) }
 
-      submenu = parent_menu.add_submenu(MENU_TITLE)
-      submenu.add_item(IMPORT_COMMAND_TITLE) { start_import }
-      submenu.add_item(SETTINGS_COMMAND_TITLE) { tool.settings_dialog.show }
+    unless parent_label
+      log('No suitable parent menu found')
+      return
     end
 
+    parent_menu = menu_for(parent_label)
+    submenu = parent_menu.add_submenu(MENU_TITLE)
+    submenu.add_item(IMPORT_COMMAND_TITLE) { start_import }
+    submenu.add_item(SETTINGS_COMMAND_TITLE) { tool.settings_dialog.show }
+
     @menu_created = true
-    log('Menu items registered')
+    log("Menu items registered under '#{parent_label}'")
   rescue StandardError => e
     @menu_created = false
     log("Failed to set up menu: #{e.class}: #{e.message}")
