@@ -67,6 +67,14 @@ module PointCloudPlugin
         assert_equal [1, 2, 3], fourth_point[:color]
         assert_nil fourth_point[:intensity]
       end
+
+      def test_pack_marks_empty_chunks
+        chunk = ChunkPacker.new.pack([])
+
+        assert chunk.empty?
+        assert chunk.metadata[:empty]
+        assert_nil chunk.metadata[:bounds]
+      end
     end
   end
 end
