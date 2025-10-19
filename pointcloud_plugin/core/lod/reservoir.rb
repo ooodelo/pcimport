@@ -58,6 +58,15 @@ module PointCloudPlugin
           reservoir.sample(quota)
         end
 
+        def sample_all(limit = nil)
+          samples = @reservoirs.each_value.flat_map { |reservoir| reservoir.sample(nil) }
+          return samples if limit.nil? || limit <= 0 || samples.length <= limit
+
+          limit = limit.to_i
+          limit = samples.length if limit > samples.length
+          samples.sample(limit)
+        end
+
         def reset!
           @reservoirs.each_value(&:reset!)
         end

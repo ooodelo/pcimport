@@ -311,7 +311,13 @@ module PointCloudPlugin
 
         samples = []
         manager.each_cloud do |cloud|
-          samples.concat(cloud.pipeline.reservoir.samples)
+          reservoir = cloud.pipeline&.reservoir
+          next unless reservoir
+
+          reservoir_samples = reservoir.sample_all
+          next if reservoir_samples.empty?
+
+          samples.concat(reservoir_samples)
         end
         return if samples.empty?
 
