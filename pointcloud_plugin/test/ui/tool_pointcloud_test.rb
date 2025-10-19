@@ -171,7 +171,9 @@ module PointCloudPlugin
         manager = FakeManager.new([cloud])
 
         tool = ToolPointCloud.new(manager)
-        tool.send(:gather_chunks, view)
+        tool.stub(:current_frustum, nil) do
+          tool.send(:gather_chunks, view)
+        end
 
         assert_empty tool.instance_variable_get(:@active_chunks)
         assert_equal 1, prefetcher.visible_calls.size
@@ -240,6 +242,38 @@ module PointCloudPlugin
         tool.send(:update_snap_target, view, 0, 0)
 
         assert_equal sample_point, tool.instance_variable_get(:@snap_target)
+      end
+
+      def test_screen_culling_false_uses_frustum
+        tool = ToolPointCloud.new(FakeManager.new([]))
+        bounds = { min: [-1.0, -1.0, -1.0], max: [1.0, 1.0, 1.0] }
+        frustum = Struct.new(:result) do
+          def intersects_bounds?(_bounds)
+            result
+          end
+        end.new(true)
+
+        tool.stub(:screen_culling_visibility, false) do
+          assert tool.send(:visible_bounds?, bounds, frustum, nil)
+        end
+      end
+
+      def test_screen_and_frustum_missing_defaults_to_visible
+        tool = ToolPointCloud.new(FakeManager.new([]))
+        bounds = { min: [-1.0, -1.0, -1.0], max: [1.0, 1.0, 1.0] }
+
+        tool.stub(:screen_culling_visibility, nil) do
+          assert tool.send(:visible_bounds?, bounds, nil, nil)
+        end
+      end
+
+      def test_screen_false_without_frustum_is_invisible
+        tool = ToolPointCloud.new(FakeManager.new([]))
+        bounds = { min: [-1.0, -1.0, -1.0], max: [1.0, 1.0, 1.0] }
+
+        tool.stub(:screen_culling_visibility, false) do
+          refute tool.send(:visible_bounds?, bounds, nil, nil)
+        end
       end
 
       def test_preview_samples_fall_back_to_active_chunks
