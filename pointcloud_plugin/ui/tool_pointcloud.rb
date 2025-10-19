@@ -53,6 +53,7 @@ module PointCloudPlugin
       end
 
       def draw(view)
+        points_drawn = 0
         point_size = safe_point_size
         default_color = default_point_color
 
@@ -83,6 +84,7 @@ module PointCloudPlugin
                 sketchup_points = convert_positions_to_points(batch)
                 next if sketchup_points.empty?
 
+                points_drawn += sketchup_points.length
                 view.draw_points(sketchup_points, point_size, 1, color)
               end
             end
@@ -90,6 +92,7 @@ module PointCloudPlugin
         rescue => e
           Kernel.puts("[PointCloudPlugin:draw] #{e.class}: #{e.message}\n  #{e.backtrace&.first}")
         ensure
+          @last_drawn_point_count = points_drawn
           draw_snap(view, point_size)
           PointCloud::UI::PreviewLayer.draw(view, self) if defined?(PointCloud::UI::PreviewLayer)
           hud.draw(view)
@@ -101,11 +104,71 @@ module PointCloudPlugin
         view.invalidate if view.respond_to?(:invalidate)
       end
 
+      def last_drawn_point_count
+        @last_drawn_point_count ||= 0
+      end
+
+      def preview_samples(limit = 2_000)
+        limit = limit.to_i
+        limit = 0 if limit.negative?
+
+        samples = gather_reservoir_samples(limit)
+        remaining = limit.positive? ? [limit - samples.length, 0].max : nil
+
+        if remaining.nil? || remaining.positive?
+          samples.concat(gather_active_chunk_samples(remaining))
+        end
+
+        limit.positive? ? samples.first(limit) : samples
+      end
+
       private
 
       def hook_settings
         settings_dialog.on_change do |new_settings|
           @settings = new_settings
+        end
+      end
+
+      def gather_reservoir_samples(limit)
+        samples = []
+        manager.each_cloud do |cloud|
+          reservoir = cloud.pipeline&.reservoir
+          next unless reservoir
+
+          reservoir_samples = reservoir.sample_all(limit)
+          next if reservoir_samples.empty?
+
+          samples.concat(reservoir_samples)
+          break if limit.positive? && samples.length >= limit
+        end
+        samples
+      end
+
+      def gather_active_chunk_samples(limit)
+        return [] if limit&.zero?
+
+        samples = []
+        each_active_chunk do |chunk|
+          chunk.size.times do |index|
+            samples << chunk.point_at(index)
+            if limit && samples.length >= limit
+              return samples
+            end
+          end
+        end
+
+        samples
+      end
+
+      def each_active_chunk
+        return enum_for(:each_active_chunk) unless block_given?
+
+        @chunk_usage.each do |key|
+          entry = @active_chunks[key]
+          next unless entry
+
+          yield entry[:chunk]
         end
       end
 
@@ -347,16 +410,7 @@ module PointCloudPlugin
       def update_snap_target(view, x, y)
         return unless view.respond_to?(:pickray)
 
-        samples = []
-        manager.each_cloud do |cloud|
-          reservoir = cloud.pipeline&.reservoir
-          next unless reservoir
-
-          reservoir_samples = reservoir.sample_all
-          next if reservoir_samples.empty?
-
-          samples.concat(reservoir_samples)
-        end
+        samples = preview_samples
         return if samples.empty?
 
         origin, direction = view.pickray(x, y)
