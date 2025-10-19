@@ -81,9 +81,13 @@ module PointCloudPlugin
             colors[:r] << point[:color][0]
             colors[:g] << point[:color][1]
             colors[:b] << point[:color][2]
+          else
+            colors[:r] << nil
+            colors[:g] << nil
+            colors[:b] << nil
           end
 
-          intensities << point[:intensity] if point.key?(:intensity)
+          intensities << (point.key?(:intensity) ? point[:intensity] : nil)
         end
 
         metadata = { bounds: bounds, quantization_bits: @quantization_bits }
