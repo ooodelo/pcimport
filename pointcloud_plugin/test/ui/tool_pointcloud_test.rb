@@ -13,6 +13,24 @@ module PointCloudPlugin
         end
       end
 
+      class SampleChunk
+        def initialize(points)
+          @points = points
+        end
+
+        def metadata
+          {}
+        end
+
+        def size
+          @points.length
+        end
+
+        def point_at(index)
+          @points[index]
+        end
+      end
+
       FakeCloud = Struct.new(:id, :pipeline, :prefetcher)
 
       class FakeManager
@@ -139,6 +157,37 @@ module PointCloudPlugin
         tool.send(:update_snap_target, view, 0, 0)
 
         assert_equal sample_point, tool.instance_variable_get(:@snap_target)
+      end
+
+      def test_preview_samples_fall_back_to_active_chunks
+        reservoir_sample = { position: [0.0, 0.0, 0.0] }
+        reservoir = Class.new do
+          def initialize(samples)
+            @samples = samples
+          end
+
+          def sample_all(limit = nil)
+            limit && limit > 0 ? @samples.first(limit) : @samples
+          end
+        end.new([reservoir_sample])
+
+        chunk_points = [
+          { position: [1.0, 0.0, 0.0] },
+          { position: [2.0, 0.0, 0.0] }
+        ]
+        chunk = SampleChunk.new(chunk_points)
+
+        pipeline = FakePipeline.new([['chunk', chunk]], reservoir: reservoir)
+        cloud = FakeCloud.new(1, pipeline, FakePrefetcher.new)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+        tool.instance_variable_set(:@active_chunks, { 'chunk' => { chunk: chunk, store: Object.new } })
+        tool.instance_variable_set(:@chunk_usage, ['chunk'])
+
+        samples = tool.preview_samples(3)
+
+        assert_equal [reservoir_sample, *chunk_points], samples
       end
 
       private
