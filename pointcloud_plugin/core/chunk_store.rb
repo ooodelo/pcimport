@@ -10,14 +10,16 @@ module PointCloudPlugin
 
       attr_reader :cache_path, :max_in_memory
 
-      def initialize(cache_path:, max_in_memory: 32)
+      DEFAULT_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
+
+      def initialize(cache_path:, max_in_memory: 32, memory_limit_mb: nil)
         @cache_path = cache_path
         @max_in_memory = max_in_memory
         @entries = {}
         @lru = []
         @on_remove_callbacks = []
         @bytes_in_ram = 0
-        @memory_limit_bytes = 512 * 1024 * 1024
+        @memory_limit_bytes = normalize_memory_limit(memory_limit_mb)
         FileUtils.mkdir_p(cache_path)
       end
 
@@ -88,11 +90,18 @@ module PointCloudPlugin
       end
 
       def memory_limit_mb=(mb)
-        @memory_limit_bytes = (mb.to_i * 1024 * 1024)
+        @memory_limit_bytes = normalize_memory_limit(mb)
         evict_until_limit
       end
 
       private
+
+      def normalize_memory_limit(mb)
+        return DEFAULT_MEMORY_LIMIT_BYTES if mb.nil?
+
+        bytes = mb.to_i * 1024 * 1024
+        bytes.positive? ? bytes : 0
+      end
 
       def persist_to_disk(key, chunk)
         File.binwrite(chunk_path(key), Marshal.dump(chunk))
