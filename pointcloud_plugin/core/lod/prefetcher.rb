@@ -20,7 +20,14 @@ module PointCloudPlugin
           @index_dirty = true
         end
 
-        def prefetch_for_view(frustum, budget: 8, camera_position: nil, timestamp: nil)
+        def prefetch_for_view(
+          frustum,
+          budget: 8,
+          camera_position: nil,
+          camera_direction: nil,
+          view: nil,
+          timestamp: nil
+        )
           timestamp ||= current_time
           track_camera_movement(camera_position, timestamp) if camera_position
 
@@ -33,6 +40,9 @@ module PointCloudPlugin
 
           frustum = extend_frustum(frustum, movement_vector)
 
+          camera_forward = normalized_vector(camera_direction) || normalized_vector(movement_vector)
+          camera_reference_position = camera_position || predicted_position || last_position
+
           root = ensure_index_up_to_date
           return unless root
 
@@ -43,11 +53,20 @@ module PointCloudPlugin
                     root.visible_nodes(nil)
                   end
 
-          keys = nodes.flat_map { |node| node.chunk_refs.map { |ref| ref[:key] } }.uniq
-          @chunk_store.prefetch(keys.first(budget))
+          keys = prioritized_chunk_keys(
+            nodes,
+            budget,
+            camera_forward,
+            camera_reference_position,
+            view
+          )
+
+          @chunk_store.prefetch(keys) if keys.any?
         end
 
         private
+
+        VISIBILITY_MARGIN = 0.1
 
         def track_camera_movement(position, timestamp)
           entry = { position: position.map(&:to_f), timestamp: timestamp.to_f }
@@ -132,6 +151,103 @@ module PointCloudPlugin
           end
 
           @index_builder.root
+        end
+
+        def prioritized_chunk_keys(nodes, budget, camera_forward, camera_position, view)
+          candidates = nodes.flat_map do |node|
+            node.chunk_refs.map do |reference|
+              build_prefetch_candidate(reference, camera_forward, camera_position, view)
+            end
+          end.compact
+
+          ordered_keys = candidates
+            .sort_by do |candidate|
+              [
+                candidate[:near_visible] ? 0 : 1,
+                -candidate[:cosine],
+                candidate[:distance]
+              ]
+            end
+            .map { |candidate| candidate[:key] }
+            .uniq
+
+          return [] if budget && budget <= 0
+          return ordered_keys unless budget && budget.positive?
+
+          ordered_keys.first(budget)
+        end
+
+        def build_prefetch_candidate(reference, camera_forward, camera_position, view)
+          key = reference[:key]
+          bounds = reference[:bounds]
+
+          distance_vector = vector_to_bounds(bounds, camera_position)
+          distance = vector_length(distance_vector)
+          cosine = cosine_to_forward(camera_forward, distance_vector, distance)
+
+          near_visible = near_visible_chunk?(bounds, view)
+
+          {
+            key: key,
+            cosine: cosine,
+            distance: distance || Float::INFINITY,
+            near_visible: near_visible
+          }
+        end
+
+        def vector_to_bounds(bounds, camera_position)
+          return nil unless bounds && camera_position
+
+          center = bounds_center(bounds)
+          center.zip(camera_position).map { |component, origin| component - origin }
+        end
+
+        def bounds_center(bounds)
+          mins = bounds[:min]
+          maxs = bounds[:max]
+          mins.each_with_index.map { |value, axis| (value + maxs[axis]) * 0.5 }
+        end
+
+        def cosine_to_forward(camera_forward, distance_vector, distance)
+          return -1.0 unless camera_forward && distance_vector && distance && distance.positive?
+
+          dot_product(camera_forward, distance_vector) / distance
+        end
+
+        def vector_length(vector)
+          return nil unless vector
+
+          Math.sqrt(vector.sum { |component| component * component })
+        end
+
+        def normalized_vector(vector)
+          return unless vector
+
+          length = vector_length(vector)
+          return unless length && length.positive?
+
+          vector.map { |component| component / length }
+        end
+
+        def near_visible_chunk?(bounds, view)
+          return false unless bounds
+          return false unless defined?(PointCloud::UI::Visibility)
+
+          visibility = PointCloud::UI::Visibility
+          return false unless visibility.respond_to?(:chunk_visible?)
+
+          view ||= visibility.respond_to?(:current_view) ? visibility.current_view : nil
+          return false unless view
+
+          margin = visibility.respond_to?(:prefetch_margin) ? visibility.prefetch_margin : VISIBILITY_MARGIN
+
+          begin
+            visibility.chunk_visible?(view, bounds, margin: margin)
+          rescue ArgumentError
+            visibility.chunk_visible?(view, bounds)
+          rescue StandardError
+            false
+          end
         end
 
         def current_entries
