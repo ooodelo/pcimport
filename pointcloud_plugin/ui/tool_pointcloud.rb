@@ -750,12 +750,23 @@ module PointCloudPlugin
       def visible_bounds?(bounds, frustum, view)
         return false unless bounds_valid?(bounds)
 
-        visible = screen_culling_visibility(view, bounds)
-        return visible unless visible.nil?
+        screen_visible = screen_culling_visibility(view, bounds)
+        return true if screen_visible == true
 
-        return false unless frustum
+        frustum_visible = frustum_visibility(frustum, bounds)
+        return frustum_visible unless frustum_visible.nil?
+
+        return false if screen_visible == false
+
+        true
+      end
+
+      def frustum_visibility(frustum, bounds)
+        return nil unless frustum&.respond_to?(:intersects_bounds?)
 
         frustum.intersects_bounds?(bounds)
+      rescue StandardError
+        nil
       end
 
       def screen_culling_visibility(view, bounds)
