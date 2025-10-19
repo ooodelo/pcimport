@@ -5,6 +5,7 @@ require_relative '../core/chunk'
 require_relative '../core/chunk_store'
 require_relative '../core/file_hasher'
 require_relative '../core/lod/pipeline'
+require_relative '../core/performance_logger'
 require_relative '../core/sample_cache'
 require_relative '../core/sampling/voxel_reservoir_sampler'
 require_relative 'main_thread_queue'
@@ -16,9 +17,10 @@ module PointCloudPlugin
     class ImportJob
       DEFAULT_PREVIEW_THRESHOLD = 0.12
       STREAMING_COMPATIBILITY_FLAG = 'PCIMPORT_STREAMING_COMPAT'
+      TRACKED_PERFORMANCE_STAGES = %i[initializing hash_check sampling cache_write build preview_build].freeze
 
       attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
-      attr_accessor :cloud_id
+      attr_reader :cloud_id, :performance_logger
       attr_reader :preview_activation_ratio
 
       def initialize(path:, reader:, pipeline:, queue: MainThreadQueue.new)
@@ -45,6 +47,15 @@ module PointCloudPlugin
         @stage_durations = Hash.new(0.0)
         @stage_start_time = nil
         @last_error_info = nil
+        @performance_logger = Core::PerformanceLogger.new
+        @performance_logger.set_metadata('source_path', path) if path
+        @performance_report_written = false
+        @cloud_id = nil
+      end
+
+      def cloud_id=(value)
+        @cloud_id = value
+        @performance_logger&.set_metadata('cloud_id', value)
       end
 
       def start(&block)
@@ -78,6 +89,14 @@ module PointCloudPlugin
       def run
         size_in_bytes = file_size_bytes
         estimated_total = estimate_total_points(size_in_bytes)
+        @performance_logger.reset!
+        @performance_logger.set_metadata('source_path', path) if path
+        @performance_logger.set_metadata('cloud_id', cloud_id) if cloud_id
+        @performance_logger.set_metadata('cache_hit', false)
+        @performance_logger.set_metadata('size_in_bytes', size_in_bytes) if size_in_bytes
+        @performance_logger.set_metadata('estimated_total_points', estimated_total) if estimated_total
+        @performance_logger.set_metadata('job_id', SecureRandom.uuid)
+        @performance_report_written = false
         @start_time = monotonic_time
         @stage_start_time = @start_time
         @last_log_time = @start_time
@@ -89,6 +108,7 @@ module PointCloudPlugin
         @sample_ready = false
         @anchors_ready = false
         @last_error_info = nil
+        @performance_logger.start_stage(:initializing)
 
         log_start(size_in_bytes, estimated_total)
         perform_import(
@@ -102,7 +122,14 @@ module PointCloudPlugin
 
       def perform_import(size_in_bytes:, estimated_total:, streaming: false)
         signature = perform_hash_check
-        manifest = pipeline&.chunk_store&.manifest
+        store = pipeline.respond_to?(:chunk_store) ? pipeline.chunk_store : nil
+        manifest = store&.manifest
+        cache_path = store&.cache_path
+        @performance_logger.set_metadata('cache_path', cache_path) if cache_path
+        if manifest
+          project_path = manifest.respond_to?(:project_path) ? manifest.project_path : nil
+          @performance_logger.set_metadata('project_path', project_path) if project_path
+        end
 
         if manifest && signature && reuse_cache_from_manifest(
              manifest,
@@ -130,6 +157,7 @@ module PointCloudPlugin
 
           batch_points = batch.respond_to?(:size) ? batch.size : Array(batch).size
           total_points += batch_points
+          @performance_logger.record_points(:sampling, batch_points)
           ratio = progress_ratio(total_points, estimated_total)
           update_stage_progress(:sampling, ratio)
 
@@ -142,6 +170,7 @@ module PointCloudPlugin
 
           key = next_key
           pipeline.submit_chunk(key, chunk)
+          @performance_logger.record_points(:cache_write, batch_points)
           preview_became_ready = mark_preview_ready(first_chunk: first_chunk, ratio: ratio)
 
           @progress = total_points
@@ -205,6 +234,13 @@ module PointCloudPlugin
         @completion_status = :completed
         finalize_stage_completion
         log_completion(total_points, elapsed, size_in_bytes)
+        persist_performance_summary(
+          manifest: manifest,
+          status: @completion_status,
+          total_points: total_points,
+          size_in_bytes: size_in_bytes,
+          estimated_total: estimated_total
+        )
         transition_state(:navigating)
 
         queue.push do
@@ -264,6 +300,7 @@ module PointCloudPlugin
         metadata = Core::SampleCache.metadata(cache_path)
         update_sample_flags(sample_ready: metadata[:sample_ready], anchors_ready: metadata[:anchors_ready])
         @cache_hit = true
+        @performance_logger.set_metadata('cache_hit', true)
 
         total_points = 0
         preview_accumulator = []
@@ -281,6 +318,8 @@ module PointCloudPlugin
 
           points_in_chunk = chunk.respond_to?(:size) ? chunk.size : 0
           total_points += points_in_chunk
+          @performance_logger.record_points(:sampling, points_in_chunk)
+          @performance_logger.record_points(:cache_write, points_in_chunk)
 
           append_preview_samples(preview_accumulator, sample_from_chunk(chunk, PREVIEW_SAMPLE_LIMIT))
 
@@ -352,6 +391,13 @@ module PointCloudPlugin
         @completion_status = :completed
         finalize_stage_completion
         log_completion(total_points, elapsed, size_in_bytes)
+        persist_performance_summary(
+          manifest: manifest,
+          status: @completion_status,
+          total_points: total_points,
+          size_in_bytes: size_in_bytes,
+          estimated_total: estimated_total
+        )
         transition_state(:navigating)
 
         queue.push do
@@ -563,7 +609,7 @@ module PointCloudPlugin
           group = nil
           begin
             builder = PointCloudPlugin::UI::CPointsBuilder.new
-            group = builder.build(cloud_id: cloud_id, samples: samples)
+            group = builder.build(cloud_id: cloud_id, samples: samples, logger: @performance_logger)
             apply_preview_visibility_settings
           rescue StandardError => e
             warn("Failed to build preview construction points: #{e.message}")
@@ -741,31 +787,58 @@ module PointCloudPlugin
       end
 
       def timings_snapshot
-        now = monotonic_time
-        durations = {}
+        summary = @performance_logger.summary
+        summary['cache_hit'] = cache_hit?
+        summary['status'] = @completion_status.to_s if @completion_status
+        summary['total_points'] = @performance_logger.total_points
+        summary
+      end
 
-        @stage_durations.each do |stage, value|
-          durations[stage] = value.to_f
+      def persist_performance_summary(manifest: nil, status: nil, total_points: nil, size_in_bytes: nil, estimated_total: nil)
+        return if @performance_report_written
+
+        finish_logging_for(@state)
+        @performance_logger.set_metadata('status', status.to_s) if status
+        @performance_logger.set_metadata('total_points', total_points) if total_points
+        @performance_logger.set_metadata('size_in_bytes', size_in_bytes) if size_in_bytes
+        @performance_logger.set_metadata('estimated_total_points', estimated_total) if estimated_total
+        @performance_logger.set_metadata('cache_hit', cache_hit?)
+
+        summary = @performance_logger.summary
+        summary['cache_hit'] = cache_hit?
+        summary['status'] = status.to_s if status
+        summary['total_points'] = @performance_logger.total_points
+
+        write_performance_report(summary)
+
+        if status == :completed && manifest && manifest.respond_to?(:performance=)
+          manifest.performance = summary
+          manifest.write! if manifest.respond_to?(:write!)
         end
 
-        if @stage_start_time && @state
-          elapsed = now - @stage_start_time
-          durations[@state] = durations.fetch(@state, 0.0) + (elapsed.positive? ? elapsed : 0.0)
-        end
+        @performance_report_written = true
+        summary
+      end
 
-        default_stage_progress.keys.each do |stage|
-          durations[stage] = durations.fetch(stage, 0.0)
-        end
+      def write_performance_report(summary)
+        return unless summary.is_a?(Hash)
 
-        total = if @start_time
-                  now - @start_time
-                else
-                  durations.values.sum
-                end
+        path = performance_report_path
+        return unless path
 
-        total = 0.0 unless total&.positive?
+        require 'json'
+        require 'fileutils'
 
-        { total: total.to_f, stages: durations }
+        FileUtils.mkdir_p(File.dirname(path))
+        File.binwrite(path, JSON.pretty_generate(summary))
+      rescue StandardError => e
+        warn("Failed to write performance log: #{e.message}")
+      end
+
+      def performance_report_path
+        File.expand_path('~/Library/Logs/PointCloudImporter/last_run.json')
+      rescue StandardError
+        nil
       end
 
       def update_sample_flags(sample_ready: nil, anchors_ready: nil)
@@ -802,6 +875,24 @@ module PointCloudPlugin
           @stage_durations[stage] += elapsed if elapsed.positive?
         end
         now
+      end
+
+      def start_logging_for(stage)
+        return unless tracked_stage?(stage)
+
+        @performance_logger&.start_stage(stage)
+      end
+
+      def finish_logging_for(stage)
+        return unless tracked_stage?(stage)
+
+        @performance_logger&.finish_stage(stage)
+      end
+
+      def tracked_stage?(stage)
+        return false if stage.nil?
+
+        TRACKED_PERFORMANCE_STAGES.include?(stage.to_sym)
       end
 
       def capture_error_info(error)
@@ -1141,9 +1232,11 @@ module PointCloudPlugin
         return if @state == new_state
 
         timestamp = record_stage_duration(@state)
+        finish_logging_for(@state)
         @state = new_state
         @stage_durations[@state] ||= 0.0
         @stage_start_time = timestamp
+        start_logging_for(@state)
         queue.push { dispatch_state_change(new_state) }
       end
 
@@ -1211,6 +1304,14 @@ module PointCloudPlugin
         elapsed = elapsed_time
         bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
         resume_view_updates
+        manifest = pipeline.respond_to?(:chunk_store) ? pipeline.chunk_store&.manifest : nil
+        persist_performance_summary(
+          manifest: manifest,
+          status: @completion_status,
+          total_points: total_points,
+          size_in_bytes: size_in_bytes,
+          estimated_total: estimated_total
+        )
 
         queue.push do
           payload = build_status_payload(
@@ -1233,6 +1334,14 @@ module PointCloudPlugin
         transition_state(:cancelled)
         resume_view_updates
         capture_error_info(error)
+        manifest = pipeline.respond_to?(:chunk_store) ? pipeline.chunk_store&.manifest : nil
+        persist_performance_summary(
+          manifest: manifest,
+          status: @completion_status,
+          total_points: @progress,
+          size_in_bytes: file_size_bytes,
+          estimated_total: nil
+        )
         queue.push do
           payload = build_status_payload
           dispatch_payload(payload)

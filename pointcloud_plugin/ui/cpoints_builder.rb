@@ -19,14 +19,26 @@ module PointCloudPlugin
         @model = model
       end
 
-      def build(cloud_id:, samples:)
+      def build(cloud_id:, samples:, logger: nil)
         return unless valid_environment?
+
+        logging_active = false
+        if logger&.respond_to?(:start_stage)
+          logger.start_stage(:preview_build)
+          logging_active = true
+        end
 
         model.start_operation(operation_name(cloud_id), true)
         begin
           remove_existing_preview_group(cloud_id)
 
           partitioned = partition_samples(Array(samples))
+          total_points = partitioned[:all].length + partitioned[:anchors].length
+          logger.record_points(:preview_build, total_points) if logger&.respond_to?(:record_points)
+          if logger&.respond_to?(:set_metadata)
+            logger.set_metadata('preview_total_points', total_points)
+            logger.set_metadata('preview_anchor_points', partitioned[:anchors].length)
+          end
           if partitioned[:all].empty? && partitioned[:anchors].empty?
             commit_operation
             return nil
@@ -39,6 +51,8 @@ module PointCloudPlugin
         rescue StandardError
           abort_operation
           raise
+        ensure
+          logger.finish_stage(:preview_build) if logging_active && logger&.respond_to?(:finish_stage)
         end
       end
 

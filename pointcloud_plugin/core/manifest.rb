@@ -143,6 +143,14 @@ module PointCloudPlugin
         @data['preview_file'] = value
       end
 
+      def performance
+        @data['performance']
+      end
+
+      def performance=(value)
+        @data['performance'] = deep_stringify(value)
+      end
+
       def anchors
         @data['anchors'] ||= default_anchors
       end
@@ -179,7 +187,8 @@ module PointCloudPlugin
           'source' => nil,
           'chunks' => [],
           'preview_file' => nil,
-          'anchors' => default_anchors
+          'anchors' => default_anchors,
+          'performance' => nil
         }
       end
 
