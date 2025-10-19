@@ -6,6 +6,7 @@ require 'tmpdir'
 require 'time'
 
 require_relative 'manifest'
+require_relative 'sample_cache'
 
 module PointCloudPlugin
   module Core
@@ -116,9 +117,62 @@ module PointCloudPlugin
         @clouds.transform_values(&:dup)
       end
 
+      def cache_hit_payload(cache_path:, manifest: nil)
+        cache_path = cache_path && cache_path.to_s
+        manifest ||= safe_manifest(manifest, cache_path)
+
+        metadata = Core::SampleCache.metadata(cache_path)
+        anchors_ready = metadata[:anchors_ready]
+
+        if manifest
+          anchors_data = manifest.anchors || {}
+          anchors_ready ||= anchors_data['has_custom_anchors'] || anchors_data[:has_custom_anchors]
+          anchors_ready ||= anchors_data['has_world_anchor'] || anchors_data[:has_world_anchor]
+        end
+
+        sample_ready = metadata[:sample_ready]
+        anchors_ready &&= sample_ready
+
+        stage_progress = default_stage_progress_hash.transform_values { 1.0 }
+        timings = {
+          total: 0.0,
+          stages: stage_progress.transform_values { 0.0 }
+        }
+
+        {
+          stage: :navigating,
+          stage_progress: stage_progress,
+          cache_hit: true,
+          sample_ready: sample_ready,
+          anchors_ready: anchors_ready,
+          preview_ready: sample_ready,
+          timings: timings,
+          error: nil,
+          completion_status: :completed
+        }
+      end
+
       private
 
       attr_reader :file_utils
+
+      def safe_manifest(manifest, cache_path)
+        return manifest if manifest.is_a?(Manifest)
+        return nil unless cache_path && !cache_path.to_s.empty?
+
+        Manifest.load(cache_path)
+      rescue StandardError
+        nil
+      end
+
+      def default_stage_progress_hash
+        {
+          hash_check: 0.0,
+          sampling: 0.0,
+          cache_write: 0.0,
+          build: 0.0
+        }
+      end
 
       def migrate_clouds!
         return if @clouds.empty?

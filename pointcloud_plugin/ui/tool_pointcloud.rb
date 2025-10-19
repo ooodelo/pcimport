@@ -58,6 +58,8 @@ module PointCloudPlugin
         @active_cloud_id = nil
         @preview_buffer = []
         @preview_ready = false
+        @sample_ready = false
+        @anchors_ready = false
         @visualization_announced = false
         @auto_camera_active = true
         @camera_focused = false
@@ -67,7 +69,8 @@ module PointCloudPlugin
         update_preview_controls_ui(
           false,
           show_points: @settings[:preview_show_points],
-          anchors_only: @settings[:preview_anchor_only]
+          anchors_only: @settings[:preview_anchor_only],
+          anchors_available: false
         )
       end
 
@@ -185,6 +188,8 @@ module PointCloudPlugin
         @active_cloud_id = cloud_id
         @preview_buffer.clear
         @preview_ready = false
+        @sample_ready = false
+        @anchors_ready = false
         @visualization_announced = false
         @camera_focused = false
         @auto_camera_active = true
@@ -195,7 +200,8 @@ module PointCloudPlugin
         update_preview_controls_ui(
           false,
           show_points: @settings[:preview_show_points],
-          anchors_only: @settings[:preview_anchor_only]
+          anchors_only: @settings[:preview_anchor_only],
+          anchors_available: false
         )
         refresh_progress_dialog_clouds
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
@@ -209,12 +215,29 @@ module PointCloudPlugin
         update_import_state(state, stage_progress: stage_progress)
       end
 
+      def handle_import_payload(job:, payload:)
+        return unless payload.is_a?(Hash)
+        return if @active_import_job && job && job != @active_import_job
+
+        stage = payload[:stage] || payload['stage']
+        stage_progress = payload[:stage_progress] || payload['stage_progress']
+        update_import_state(stage, stage_progress: stage_progress) if stage
+
+        update_import_overlay_from_payload(payload)
+
+        sample_ready = extract_boolean(payload, :sample_ready)
+        anchors_ready = extract_boolean(payload, :anchors_ready)
+        update_sample_capabilities(sample_ready, anchors_ready)
+
+        error_info = payload[:error] || payload['error']
+        handle_import_error(error_info) if error_info
+      end
+
       def handle_import_chunk(job:, key:, chunk:, info: {})
         return unless job && job == @active_import_job
         return unless chunk
 
         hud.update(points_on_screen: chunk.size)
-        import_overlay.update_stage_progress(info[:stage_progress]) if info.is_a?(Hash)
 
         ingest_preview_points(Array(info[:preview_points])) if info.is_a?(Hash) && info[:preview_points]
         ingest_preview_chunk(chunk)
@@ -222,17 +245,6 @@ module PointCloudPlugin
         if info.is_a?(Hash) && info[:first_chunk] && @auto_camera_active && !@camera_focused
           focused = PointCloudPlugin.focus_camera_on_chunk(chunk) if PointCloudPlugin.respond_to?(:focus_camera_on_chunk)
           @camera_focused = true if focused
-        end
-
-        if info.is_a?(Hash) && info[:preview_ready]
-          @preview_ready = true
-          update_preview_controls_ui(
-            true,
-            show_points: @settings[:preview_show_points],
-            anchors_only: @settings[:preview_anchor_only]
-          )
-        elsif info.is_a?(Hash)
-          sync_preview_dialog_state
         end
 
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
@@ -275,13 +287,16 @@ module PointCloudPlugin
         @active_cloud_id = nil
         @preview_buffer.clear
         @preview_ready = false
+        @sample_ready = false
+        @anchors_ready = false
         @visualization_announced = false
         @memory_notice_expires_at = nil
         hud.update(memory_notice: nil)
         update_preview_controls_ui(
           false,
           show_points: @settings[:preview_show_points],
-          anchors_only: @settings[:preview_anchor_only]
+          anchors_only: @settings[:preview_anchor_only],
+          anchors_available: false
         )
         refresh_progress_dialog_clouds
         import_overlay.hide!
@@ -335,51 +350,139 @@ module PointCloudPlugin
         refresh_progress_dialog_clouds
       end
 
-      def update_preview_controls_ui(available, show_points:, anchors_only:)
-        show_points = !!show_points
-        anchors_only = show_points && !!anchors_only
+      def update_import_overlay_from_payload(payload)
+        if import_overlay.respond_to?(:update_from_payload)
+          import_overlay.update_from_payload(payload)
+        elsif payload.is_a?(Hash) && payload[:stage_progress] && import_overlay.respond_to?(:update_stage_progress)
+          import_overlay.update_stage_progress(payload[:stage_progress])
+        end
+      end
+
+      def extract_boolean(payload, key)
+        return nil unless payload.is_a?(Hash)
+
+        if payload.key?(key)
+          value = payload[key]
+        elsif payload.key?(key.to_s)
+          value = payload[key.to_s]
+        else
+          return nil
+        end
+
+        case value
+        when nil then nil
+        when true, 'true', 1, '1' then true
+        when false, 'false', 0, '0' then false
+        else
+          !!value
+        end
+      end
+
+      def update_sample_capabilities(sample_ready, anchors_ready)
+        changed = false
+
+        unless sample_ready.nil?
+          normalized = !!sample_ready
+          if @sample_ready != normalized
+            @sample_ready = normalized
+            @preview_ready = normalized
+            changed = true
+          end
+        end
+
+        unless anchors_ready.nil?
+          normalized = !!anchors_ready
+          if @anchors_ready != normalized
+            @anchors_ready = normalized
+            changed = true
+          end
+        end
+
+        if !@sample_ready && @anchors_ready
+          @anchors_ready = false
+          changed = true
+        end
+
+        sync_sample_state_to_ui if changed
+      end
+
+      def sync_sample_state_to_ui
+        update_preview_controls_ui(
+          @sample_ready,
+          show_points: @settings ? @settings[:preview_show_points] : false,
+          anchors_only: @settings ? @settings[:preview_anchor_only] : false,
+          anchors_available: @anchors_ready
+        )
+      end
+
+      def handle_import_error(error_info)
+        message = case error_info
+                  when Hash
+                    error_info[:message] || error_info['message']
+                  else
+                    error_info
+                  end
+        message = message.to_s.strip
+        message = 'Импорт завершился с ошибкой' if message.empty?
+        hud.update(load_status: "Ошибка: #{message}")
+      end
+
+      def update_preview_controls_ui(available, show_points:, anchors_only:, anchors_available: nil)
+        raw_points = !!show_points
+        raw_anchors = !!anchors_only
+        anchors_available = anchors_available.nil? ? @anchors_ready : !!anchors_available
+
+        applied_points = available && raw_points
+        applied_anchors = applied_points && raw_anchors && anchors_available
 
         if settings_dialog.respond_to?(:update_preview_controls)
           settings_dialog.update_preview_controls(
             available: available,
-            show_points: show_points,
-            anchors_only: anchors_only
+            show_points: applied_points,
+            anchors_only: applied_anchors
           )
         end
 
         if import_overlay.respond_to?(:update_preview_state)
           import_overlay.update_preview_state(
             available: available,
-            show_points: show_points,
-            show_anchors: anchors_only
+            show_points: applied_points,
+            show_anchors: applied_anchors,
+            anchors_available: anchors_available
           )
         end
       end
 
       def sync_preview_dialog_state
-        return unless import_overlay.respond_to?(:update_preview_state)
-
         show_points = !!@settings[:preview_show_points]
-        anchors_only = show_points && !!@settings[:preview_anchor_only]
-        import_overlay.update_preview_state(
-          available: @preview_ready,
+        anchors_only = !!@settings[:preview_anchor_only]
+        update_preview_controls_ui(
+          @sample_ready,
           show_points: show_points,
-          show_anchors: anchors_only
+          anchors_only: anchors_only,
+          anchors_available: @anchors_ready
         )
       end
 
       def handle_preview_visibility_change(show_points:, anchors_only:)
-        points_enabled = !!show_points
-        anchors_enabled = points_enabled && !!anchors_only
+        raw_points = !!show_points
+        raw_anchors = !!anchors_only
 
         if @settings
-          @settings[:preview_show_points] = points_enabled
-          @settings[:preview_anchor_only] = anchors_enabled
+          @settings[:preview_show_points] = raw_points
+          @settings[:preview_anchor_only] = raw_anchors
         end
 
-        update_preview_controls_ui(@preview_ready, show_points: points_enabled, anchors_only: anchors_enabled)
+        update_preview_controls_ui(
+          @sample_ready,
+          show_points: raw_points,
+          anchors_only: raw_anchors,
+          anchors_available: @anchors_ready
+        )
 
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:update_preview_visibility)
+          points_enabled = @sample_ready && raw_points
+          anchors_enabled = points_enabled && raw_anchors && @anchors_ready
           PointCloudPlugin.update_preview_visibility(
             show_points: points_enabled,
             anchor_only: anchors_enabled

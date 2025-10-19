@@ -42,6 +42,7 @@ module PointCloudPlugin
         @stage_progress = default_stage_progress
         @visibility_state = build_visibility_state(settings)
         @preview_available = false
+        @anchors_available = false
         @cloud_records = []
         @pending_scripts = []
         @manager_visible = false
@@ -50,6 +51,9 @@ module PointCloudPlugin
         @on_cancel = nil
         @on_visibility_change = nil
         @on_manager_visibility_change = nil
+        @cache_hit = false
+        @latest_error_info = nil
+        @latest_timings = { total: 0.0, stages: {} }
 
         if html_dialog_available?
           refresh_cached_clouds
@@ -136,6 +140,34 @@ module PointCloudPlugin
         push_progress_update
       end
 
+      def update_from_payload(payload)
+        data = safe_hash(payload)
+
+        stage_value = data[:stage] || data['stage']
+        update_state(stage_value) if stage_value
+
+        progress = data[:stage_progress] || data['stage_progress']
+        update_stage_progress(progress) if progress
+
+        @cache_hit = !!(data[:cache_hit] || data['cache_hit']) if data.key?(:cache_hit) || data.key?('cache_hit')
+
+        sample_ready = extract_optional_boolean(data, :sample_ready)
+        anchors_ready = extract_optional_boolean(data, :anchors_ready)
+
+        @preview_available = sample_ready unless sample_ready.nil?
+        @anchors_available = anchors_ready unless anchors_ready.nil?
+
+        @latest_timings = normalize_timings(data[:timings] || data['timings'])
+        @latest_error_info = normalize_error(data[:error] || data['error'])
+
+        update_preview_state(
+          available: @preview_available,
+          anchors_available: @anchors_available
+        ) unless using_fallback?
+
+        push_progress_update unless using_fallback?
+      end
+
       def update_settings(settings)
         return if using_fallback?
 
@@ -143,13 +175,21 @@ module PointCloudPlugin
         push_settings
       end
 
-      def update_preview_state(available:, show_points:, show_anchors:)
+      def update_preview_state(available:, show_points: nil, show_anchors: nil, anchors_available: nil)
         return if using_fallback?
 
         @preview_available = !!available
+        @anchors_available = !!anchors_available unless anchors_available.nil?
+
+        points = show_points.nil? ? !!@visibility_state[:points] : !!show_points
+        anchors = show_anchors.nil? ? !!@visibility_state[:anchors] : !!show_anchors
+
+        points &&= @preview_available
+        anchors &&= @preview_available && @anchors_available && points
+
         @visibility_state = {
-          points: !!show_points,
-          anchors: !!show_anchors && !!show_points
+          points: points,
+          anchors: anchors
         }
         push_preview_state
       end
@@ -275,6 +315,13 @@ module PointCloudPlugin
                 .toggle-group label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
                 .toggle-group input[type="checkbox"] { transform: scale(1.1); }
                 .toggle-group .hint { font-size: 11px; color: #7a8596; margin-left: 24px; }
+                .toggle-group label.disabled { opacity: 0.5; cursor: default; }
+                .status-panel { margin-top: 12px; padding: 12px; border: 1px solid #d5dbe7; border-radius: 10px; background: #f4f6fb; display: flex; flex-direction: column; gap: 6px; }
+                .status-row { display: flex; justify-content: space-between; font-size: 12px; }
+                .status-row .label { color: #657085; font-weight: 600; }
+                .status-row .value { color: #2f3b4c; }
+                .status-row.error .value { color: #d64541; }
+                .status-row.hidden { display: none; }
                 dl { margin: 0; }
                 dt { font-weight: 600; font-size: 12px; margin-top: 6px; }
                 dd { margin: 0; font-size: 12px; color: #44525f; }
@@ -284,6 +331,14 @@ module PointCloudPlugin
               <div class="section" id="progress_section">
                 <h1 id="progress_title">Загрузка облака…</h1>
                 <ul class="progress-steps" id="progress_steps">#{steps_markup}</ul>
+                <div class="status-panel" id="status_panel">
+                  <div class="status-row"><span class="label">Стадия</span><span class="value" id="status_stage">—</span></div>
+                  <div class="status-row"><span class="label">Источник</span><span class="value" id="status_cache">Новый импорт</span></div>
+                  <div class="status-row"><span class="label">Предпросмотр</span><span class="value" id="status_sample">Готовится…</span></div>
+                  <div class="status-row"><span class="label">Опорные точки</span><span class="value" id="status_anchors">Нет данных</span></div>
+                  <div class="status-row"><span class="label">Время</span><span class="value" id="status_timings">—</span></div>
+                  <div class="status-row error hidden" id="status_error_row"><span class="label">Ошибка</span><span class="value" id="status_error">—</span></div>
+                </div>
                 <div class="progress-controls">
                   <button id="manager_button" type="button">Менеджер кэша</button>
                   <button id="cancel_button" type="button">Отмена</button>
@@ -315,31 +370,64 @@ module PointCloudPlugin
                   const togglePoints = document.getElementById('toggle_points');
                   const toggleAnchors = document.getElementById('toggle_anchors');
                   const previewHint = document.getElementById('preview_hint');
+                  const togglePointsLabel = togglePoints.parentElement;
+                  const toggleAnchorsLabel = toggleAnchors.parentElement;
+                  const statusStage = document.getElementById('status_stage');
+                  const statusCache = document.getElementById('status_cache');
+                  const statusSample = document.getElementById('status_sample');
+                  const statusAnchors = document.getElementById('status_anchors');
+                  const statusTimings = document.getElementById('status_timings');
+                  const statusErrorRow = document.getElementById('status_error_row');
+                  const statusError = document.getElementById('status_error');
 
-                  let previewAvailable = false;
+                  const STAGE_LABELS = {
+                    initializing: 'Инициализация',
+                    hash_check: 'Проверка источника',
+                    sampling: 'Выборка точек',
+                    cache_write: 'Запись кэша',
+                    build: 'Построение',
+                    navigating: 'Навигация',
+                    cancelled: 'Отменено'
+                  };
+
+                  const TIMING_LABELS = {
+                    hash_check: 'Проверка',
+                    sampling: 'Выборка',
+                    cache_write: 'Запись кэша',
+                    build: 'Построение'
+                  };
+
+                  let previewCapabilities = { sample: false, anchors: false };
                   let suppressVisibilityEvent = false;
 
                   function updateProgress(payload) {
                     if (!payload) { return; }
                     progressTitle.textContent = payload.title || 'Загрузка облака…';
                     cancelButton.disabled = !payload.cancelEnabled;
+                    updateStepProgress(payload.steps);
+                    renderStatuses(payload);
+                  }
 
-                    if (Array.isArray(payload.steps)) {
-                      const byKey = {};
-                      payload.steps.forEach(step => { byKey[step.key] = step; });
-                      progressSteps.forEach(stepElement => {
-                        const key = stepElement.dataset.key;
-                        const data = byKey[key] || {};
-                        stepElement.classList.remove('pending', 'active', 'complete');
-                        const status = data.status || 'pending';
-                        stepElement.classList.add(status);
-                        const statusLabel = stepElement.querySelector('.status');
-                        if (statusLabel) {
-                          const percent = (typeof data.percent === 'number') ? Math.round(data.percent * 100) : null;
-                          statusLabel.textContent = percent !== null ? percent + '%' : '';
-                        }
-                      });
-                    }
+                  function updateStepProgress(steps) {
+                    if (!Array.isArray(steps)) { return; }
+                    const byKey = {};
+                    steps.forEach(step => {
+                      if (step && step.key) {
+                        byKey[step.key] = step;
+                      }
+                    });
+                    progressSteps.forEach(stepElement => {
+                      const key = stepElement.dataset.key;
+                      const data = byKey[key] || {};
+                      stepElement.classList.remove('pending', 'active', 'complete');
+                      const status = data.status || 'pending';
+                      stepElement.classList.add(status);
+                      const statusLabel = stepElement.querySelector('.status');
+                      if (statusLabel) {
+                        const percent = (typeof data.percent === 'number') ? Math.round(data.percent * 100) : null;
+                        statusLabel.textContent = percent !== null ? percent + '%' : '';
+                      }
+                    });
                   }
 
                   function setManagerVisible(visible) {
@@ -387,35 +475,112 @@ module PointCloudPlugin
                     target.innerHTML = rows;
                   }
 
-                  function applyVisibility(state) {
+                  function updatePreviewState(state) {
+                    state = state || {};
+                    const capabilities = state.capabilities || {};
+                    previewCapabilities.sample = !!capabilities.sample;
+                    previewCapabilities.anchors = !!capabilities.anchors;
+
                     suppressVisibilityEvent = true;
-                    const showPoints = !!state.showPoints;
-                    const showAnchors = !!state.showAnchors && showPoints;
+                    const showPoints = !!state.showPoints && previewCapabilities.sample;
+                    const showAnchors = !!state.showAnchors && previewCapabilities.sample && previewCapabilities.anchors;
                     togglePoints.checked = showPoints;
                     toggleAnchors.checked = showAnchors;
-                    toggleAnchors.disabled = !previewAvailable || !showPoints;
-                    togglePoints.disabled = !previewAvailable;
-                    previewHint.style.display = previewAvailable ? 'none' : 'block';
+                    togglePoints.disabled = !previewCapabilities.sample;
+                    togglePointsLabel.classList.toggle('disabled', togglePoints.disabled);
+                    const anchorsDisabled = !previewCapabilities.sample || !togglePoints.checked || !previewCapabilities.anchors;
+                    toggleAnchors.disabled = anchorsDisabled;
+                    toggleAnchorsLabel.classList.toggle('disabled', anchorsDisabled);
+                    previewHint.style.display = previewCapabilities.sample ? 'none' : 'block';
                     suppressVisibilityEvent = false;
-                  }
-
-                  function setPreviewAvailability(available) {
-                    previewAvailable = !!available;
-                    togglePoints.disabled = !previewAvailable;
-                    toggleAnchors.disabled = !previewAvailable || !togglePoints.checked;
-                    previewHint.style.display = previewAvailable ? 'none' : 'block';
                   }
 
                   function notifyVisibility() {
                     if (suppressVisibilityEvent) { return; }
-                    if (!previewAvailable) { return; }
+                    if (!previewCapabilities.sample) { return; }
                     const payload = {
                       points: !!togglePoints.checked,
-                      anchors: !!toggleAnchors.checked && !!togglePoints.checked
+                      anchors: !!toggleAnchors.checked && !!togglePoints.checked && previewCapabilities.anchors
                     };
                     if (window.sketchup && window.sketchup.toggleVisibility) {
                       window.sketchup.toggleVisibility(JSON.stringify(payload));
                     }
+                  }
+
+                  function renderStatuses(payload) {
+                    const stageKey = (payload && payload.stage) ? payload.stage.toString() : '';
+                    statusStage.textContent = STAGE_LABELS[stageKey] || '—';
+                    statusCache.textContent = payload && payload.cacheHit ? 'Кэш' : 'Новый импорт';
+                    const sampleReady = !!(payload && payload.sampleReady);
+                    const anchorsReady = !!(payload && payload.anchorsReady);
+                    statusSample.textContent = sampleReady ? 'Готово' : 'Готовится…';
+                    if (!sampleReady) {
+                      statusAnchors.textContent = 'Нет данных';
+                    } else if (anchorsReady) {
+                      statusAnchors.textContent = 'Готово';
+                    } else {
+                      statusAnchors.textContent = 'Недоступно';
+                    }
+                    statusTimings.textContent = formatTimings(payload && payload.timings);
+                    const errorInfo = payload && payload.error;
+                    if (errorInfo && errorInfo.message) {
+                      statusError.textContent = errorInfo.message;
+                      statusErrorRow.classList.remove('hidden');
+                      statusErrorRow.classList.add('error');
+                    } else {
+                      statusError.textContent = '—';
+                      statusErrorRow.classList.add('hidden');
+                    }
+                  }
+
+                  function readTiming(stages, key) {
+                    if (!stages || typeof stages !== 'object') { return null; }
+                    if (Object.prototype.hasOwnProperty.call(stages, key)) {
+                      return stages[key];
+                    }
+                    const stringKey = key.toString();
+                    if (Object.prototype.hasOwnProperty.call(stages, stringKey)) {
+                      return stages[stringKey];
+                    }
+                    return null;
+                  }
+
+                  function formatTimings(timings) {
+                    if (!timings || typeof timings !== 'object') { return '—'; }
+                    const total = formatDuration(timings.total);
+                    const parts = [];
+                    if (total) { parts.push('Всего ' + total); }
+                    const stages = timings.stages;
+                    ['hash_check', 'sampling', 'cache_write', 'build'].forEach(key => {
+                      const duration = formatDuration(readTiming(stages, key));
+                      if (duration) {
+                        const label = TIMING_LABELS[key] || key;
+                        parts.push(label + ': ' + duration);
+                      }
+                    });
+                    return parts.length ? parts.join(', ') : '—';
+                  }
+
+                  function formatDuration(value) {
+                    const seconds = Number(value);
+                    if (!isFinite(seconds) || seconds <= 0) { return null; }
+                    if (seconds < 1) {
+                      return Math.round(seconds * 1000) + ' мс';
+                    }
+                    if (seconds < 60) {
+                      return seconds.toFixed(1) + ' с';
+                    }
+                    const minutes = Math.floor(seconds / 60);
+                    const remaining = Math.round(seconds % 60);
+                    if (minutes >= 60) {
+                      const hours = Math.floor(minutes / 60);
+                      const mins = minutes % 60;
+                      const hourLabel = hours + ' ч';
+                      const minuteLabel = mins > 0 ? ' ' + mins + ' мин' : '';
+                      return hourLabel + minuteLabel;
+                    }
+                    const secondLabel = remaining > 0 ? ' ' + remaining + ' с' : '';
+                    return minutes + ' мин' + secondLabel;
                   }
 
                   cancelButton.addEventListener('click', () => {
@@ -433,19 +598,23 @@ module PointCloudPlugin
                   });
 
                   togglePoints.addEventListener('change', () => {
-                    if (!previewAvailable && togglePoints.checked) {
+                    if (!previewCapabilities.sample && togglePoints.checked) {
                       togglePoints.checked = false;
                       return;
                     }
                     if (!togglePoints.checked) {
                       toggleAnchors.checked = false;
                     }
-                    toggleAnchors.disabled = !previewAvailable || !togglePoints.checked;
+                    const anchorsDisabled = !previewCapabilities.sample || !togglePoints.checked || !previewCapabilities.anchors;
+                    toggleAnchors.disabled = anchorsDisabled;
+                    toggleAnchorsLabel.classList.toggle('disabled', anchorsDisabled);
+                    togglePointsLabel.classList.toggle('disabled', togglePoints.disabled);
+                    previewHint.style.display = previewCapabilities.sample ? 'none' : 'block';
                     notifyVisibility();
                   });
 
                   toggleAnchors.addEventListener('change', () => {
-                    if (!togglePoints.checked) {
+                    if (!togglePoints.checked || !previewCapabilities.anchors) {
                       toggleAnchors.checked = false;
                       return;
                     }
@@ -457,8 +626,7 @@ module PointCloudPlugin
                     setManagerVisible: setManagerVisible,
                     updateClouds: renderClouds,
                     updateSettings: renderSettings,
-                    updateVisibility: applyVisibility,
-                    setPreviewAvailability: setPreviewAvailability
+                    updatePreviewState: updatePreviewState
                   };
 
                   window.addEventListener('load', function() {
@@ -499,20 +667,31 @@ module PointCloudPlugin
       end
 
       def push_preview_state
+        return if using_fallback?
+
         state_payload = {
           showPoints: !!@visibility_state[:points],
-          showAnchors: !!@visibility_state[:anchors]
+          showAnchors: !!@visibility_state[:anchors],
+          capabilities: {
+            sample: !!@preview_available,
+            anchors: !!@anchors_available
+          }
         }
         preview_json = JSON.generate(state_payload)
-        dispatch_script("window.dialogProgress && window.dialogProgress.updateVisibility(#{preview_json})")
-        dispatch_script("window.dialogProgress && window.dialogProgress.setPreviewAvailability(#{@preview_available ? 'true' : 'false'})")
+        dispatch_script("window.dialogProgress && window.dialogProgress.updatePreviewState(#{preview_json})")
       end
 
       def progress_payload
         {
           title: STATE_TITLES.fetch(state, STATE_TITLES[:idle]),
           cancelEnabled: cancel_enabled?,
-          steps: build_step_entries
+          steps: build_step_entries,
+          stage: state,
+          cacheHit: @cache_hit,
+          sampleReady: !!@preview_available,
+          anchorsReady: !!@anchors_available,
+          timings: @latest_timings,
+          error: @latest_error_info
         }
       end
 
@@ -660,8 +839,85 @@ module PointCloudPlugin
         return {} unless value.is_a?(Hash)
 
         value.each_with_object({}) do |(key, raw), memo|
-          memo[key.to_sym] = raw.to_f
+          memo[key.to_sym] = raw
         end
+      end
+
+      def extract_optional_boolean(hash, key)
+        symbol_key = key.to_sym
+        string_key = key.to_s
+
+        if hash.key?(symbol_key)
+          value = hash[symbol_key]
+        elsif hash.key?(string_key)
+          value = hash[string_key]
+        else
+          return nil
+        end
+
+        case value
+        when nil then nil
+        when true, 'true', '1', 1 then true
+        when false, 'false', '0', 0 then false
+        else
+          !!value
+        end
+      end
+
+      def normalize_timings(value)
+        data = value.is_a?(Hash) ? value : {}
+        symbolized = safe_hash(data)
+
+        total_value = symbolized[:total] || symbolized['total']
+        total = normalize_float(total_value)
+
+        stages_source = symbolized[:stages] || symbolized['stages'] || {}
+        stages_hash = safe_hash(stages_source).each_with_object({}) do |(stage, raw), memo|
+          memo[stage.to_sym] = normalize_float(raw)
+        end
+
+        default_stage_progress.keys.each do |stage|
+          stages_hash[stage] = normalize_float(stages_hash[stage])
+        end
+
+        { total: total, stages: stages_hash }
+      rescue StandardError
+        { total: 0.0, stages: default_stage_progress.transform_values { 0.0 } }
+      end
+
+      def normalize_error(value)
+        case value
+        when nil
+          nil
+        when String
+          message = value.to_s.strip
+          message.empty? ? nil : { message: message }
+        when Hash
+          data = value
+          message = data[:message] || data['message']
+          message = message.to_s.strip if message
+          return nil if message.nil? || message.empty?
+
+          normalized = { message: message }
+          klass = data[:class] || data['class']
+          normalized[:class] = klass.to_s unless klass.nil? || klass.to_s.strip.empty?
+          backtrace = data[:backtrace] || data['backtrace']
+          backtrace = Array(backtrace).map { |line| line.to_s.strip }.reject(&:empty?)
+          normalized[:backtrace] = backtrace if backtrace.any?
+          normalized
+        else
+          nil
+        end
+      rescue StandardError
+        nil
+      end
+
+      def normalize_float(value)
+        return 0.0 if value.nil?
+
+        Float(value)
+      rescue ArgumentError, TypeError
+        0.0
       end
 
       def load_cached_clouds
