@@ -32,14 +32,25 @@ module PointCloud
       end
 
       def extract_position(sample)
-        if sample.respond_to?(:[])
-          position = sample[:position] if sample.respond_to?(:key?) ? sample.key?(:position) : true
-          position ||= sample['position'] if sample.respond_to?(:key?) ? sample.key?('position') : true
-          return normalize_coordinates(position)
+        if sample.respond_to?(:key?)
+          if sample.key?(:position)
+            position = sample[:position]
+            return normalize_coordinates(position) if position
+          end
+
+          if sample.key?('position')
+            position = sample['position']
+            return normalize_coordinates(position) if position
+          end
+        elsif sample.respond_to?(:[])
+          position = safe_position_lookup(sample, :position)
+          position ||= safe_position_lookup(sample, 'position')
+          return normalize_coordinates(position) if position
         end
 
         if sample.respond_to?(:position)
-          return normalize_coordinates(sample.position)
+          position = sample.position
+          return normalize_coordinates(position) if position
         end
 
         if sample.respond_to?(:x) && sample.respond_to?(:y) && sample.respond_to?(:z)
@@ -82,6 +93,12 @@ module PointCloud
 
       def fallback_color
         @fallback_color ||= Struct.new(:red, :green, :blue, :alpha).new(0, 0, 0, 255)
+      end
+
+      def safe_position_lookup(sample, key)
+        sample[key]
+      rescue StandardError, NameError
+        nil
       end
     end
   end
