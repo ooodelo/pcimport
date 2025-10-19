@@ -47,6 +47,18 @@ module PointCloudPlugin
           refute_empty chunks
         end
 
+        def test_next_chunks_uses_visible_keys_without_frustum
+          submit_chunk('visible', size: 3, center: [0, 0, 0])
+          submit_chunk('hidden', size: 3, center: [50, 0, 0])
+
+          chunks = @pipeline.next_chunks(
+            frame_budget: 10,
+            visible_chunk_keys: ['visible']
+          )
+
+          assert_equal ['visible'], chunks.map(&:first)
+        end
+
         def test_next_chunks_returns_single_chunk_when_larger_than_budget
           submit_chunk('oversized', size: 6, center: [0, 0, 0])
 
