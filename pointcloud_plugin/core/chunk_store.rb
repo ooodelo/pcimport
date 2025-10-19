@@ -197,7 +197,7 @@ module PointCloudPlugin
         if manifest.respond_to?(:chunks=)
           current = Array(manifest.chunks) - [filename]
           current << filename
-          manifest.chunks = current
+          manifest.chunks = current.sort
         end
 
         if manifest.respond_to?(:chunk_format_version=)

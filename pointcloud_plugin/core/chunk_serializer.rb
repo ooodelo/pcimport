@@ -9,9 +9,21 @@ module PointCloudPlugin
   module Core
     # Serializes chunk data to the PCCB (Point Cloud Chunk Binary) format.
     class ChunkSerializer
-      MAGIC = 'PCCB'
+      MAGIC = 'PCCB'.b
       VERSION = 1
-      HEADER_SIZE = 64
+      HEADER_FORMAT = 'a4 S< S< L< L< L< e10 L<'
+      HEADER_SIZE = [
+        MAGIC,
+        VERSION,
+        0,
+        0,
+        0,
+        0,
+        *Array.new(10, 0.0),
+        0
+      ].pack(HEADER_FORMAT).bytesize
+
+      MAX_PAYLOAD_LENGTH = 512 * 1024 * 1024
 
       FLAG_HAS_RGB = 0x01
       FLAG_HAS_INTENSITY = 0x02
@@ -34,13 +46,22 @@ module PointCloudPlugin
           raise InvalidHeader, 'header truncated' unless header_bytes&.bytesize == HEADER_SIZE
 
           magic, version, header_size, count, payload_length, flags, *floats, crc =
-            header_bytes.unpack('a4 S< S< L< L< L< e10 L<')
+            header_bytes.unpack(HEADER_FORMAT)
 
           raise InvalidHeader, "unexpected magic #{magic.inspect}" unless magic == MAGIC
           raise InvalidHeader, "unsupported version #{version}" unless version == VERSION
           raise InvalidHeader, "unexpected header size #{header_size}" unless header_size == HEADER_SIZE
 
-          payload = io.read(payload_length.to_i)
+          payload_length = payload_length.to_i
+          count = count.to_i
+          has_rgb = (flags & FLAG_HAS_RGB).positive?
+          has_intensity = (flags & FLAG_HAS_INTENSITY).positive?
+          empty = (flags & FLAG_EMPTY).positive?
+          quant_bits = ((flags & FLAG_QUANT_BITS_MASK) >> FLAG_QUANT_BITS_SHIFT)
+
+          validate_payload_length(count, payload_length, has_rgb, has_intensity)
+
+          payload = io.read(payload_length)
           raise CorruptedData, 'payload truncated' unless payload&.bytesize == payload_length.to_i
 
           computed_crc = Zlib.crc32(payload)
@@ -51,11 +72,6 @@ module PointCloudPlugin
           origin = floats[6, 3]
           scale = floats[9]
 
-          quant_bits = ((flags & FLAG_QUANT_BITS_MASK) >> FLAG_QUANT_BITS_SHIFT)
-          has_rgb = (flags & FLAG_HAS_RGB).positive?
-          has_intensity = (flags & FLAG_HAS_INTENSITY).positive?
-          empty = (flags & FLAG_EMPTY).positive?
-
           chunk = build_chunk(count, payload, has_rgb, has_intensity, origin, scale, bbox_min, bbox_max, quant_bits, empty)
           chunk
         end
@@ -64,10 +80,10 @@ module PointCloudPlugin
       private
 
       def serialize(chunk)
-        count = chunk.count
-        origin = Array(chunk.origin || [0.0, 0.0, 0.0])
-        scale = chunk.scale || 1.0
-        quant_bits = quantization_bits(chunk)
+        count = chunk.count.to_i
+        origin = normalize_vector(chunk.origin)
+        scale = normalize_scale(chunk.scale)
+        quant_bits = clamp_quantization_bits(quantization_bits(chunk))
         has_rgb = chunk.has_rgb?
         has_intensity = chunk.has_intensity?
         empty = chunk.respond_to?(:empty?) ? chunk.empty? : false
@@ -83,6 +99,7 @@ module PointCloudPlugin
         bbox_max = bbox[:max]
 
         payload = build_payload(chunk, count, has_rgb, has_intensity)
+        raise Error, 'payload too large to serialize' if payload.bytesize > MAX_PAYLOAD_LENGTH
         crc = Zlib.crc32(payload)
 
         header = [
@@ -97,7 +114,7 @@ module PointCloudPlugin
           *origin,
           scale,
           crc
-        ].pack('a4 S< S< L< L< L< e10 L<')
+        ].pack(HEADER_FORMAT)
 
         [header, payload]
       end
@@ -122,15 +139,17 @@ module PointCloudPlugin
       end
 
       def pack_coordinates(chunk, axis, count)
+        axis_values = Array(chunk.positions && chunk.positions[axis])
         values = Array.new(count) do |index|
-          (chunk.positions[axis][index] || 0).to_f
+          (axis_values[index] || 0).to_f
         end
         values.pack("e#{count}")
       end
 
       def pack_bytes(values, count)
+        source = Array(values)
         array = Array.new(count) do |index|
-          value = values && values[index]
+          value = source[index]
           value.nil? ? 0 : value.to_i & 0xFF
         end
         array.pack("C#{count}")
@@ -144,6 +163,29 @@ module PointCloudPlugin
         0
       rescue StandardError
         0
+      end
+
+      def clamp_quantization_bits(value)
+        return 0 unless value.respond_to?(:to_i)
+
+        [[value.to_i, 0].max, 0xFF].min
+      end
+
+      def normalize_vector(vector)
+        values = Array(vector || [0.0, 0.0, 0.0]).first(3)
+        values.fill(0.0, values.length...3)
+        values.map! { |component| component.to_f }
+      rescue StandardError
+        [0.0, 0.0, 0.0]
+      end
+
+      def normalize_scale(scale)
+        return 1.0 unless scale.respond_to?(:to_f)
+
+        value = scale.to_f
+        value.zero? ? 1.0 : value
+      rescue StandardError
+        1.0
       end
 
       def bounds(chunk)
@@ -244,6 +286,22 @@ module PointCloudPlugin
         raise CorruptedData, 'attribute payload truncated' unless bytes&.bytesize == count
 
         bytes.unpack("C#{count}")
+      end
+
+      def validate_payload_length(count, payload_length, has_rgb, has_intensity)
+        raise InvalidHeader, 'negative point count' if count.negative?
+        raise InvalidHeader, 'negative payload length' if payload_length.negative?
+        raise InvalidHeader, 'payload length too large' if payload_length > MAX_PAYLOAD_LENGTH
+
+        raise InvalidHeader, 'payload alignment invalid' unless (payload_length % 4).zero?
+
+        expected = count * 12
+        expected += count * 3 if has_rgb
+        expected += count if has_intensity
+
+        padding = payload_length - expected
+        raise InvalidHeader, 'payload shorter than expected' if padding.negative?
+        raise InvalidHeader, 'payload padding invalid' if padding >= 8
       end
     end
   end
