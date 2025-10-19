@@ -5,6 +5,7 @@ require 'set'
 require_relative '../bridge/point_cloud_manager'
 require_relative '../core/lod/pipeline'
 require_relative '../core/project_cache_manager'
+require_relative '../core/overlay_data_source'
 require_relative '../core/spatial/knn'
 require_relative '../core/spatial/frustum'
 require_relative 'hud'
@@ -13,6 +14,7 @@ require_relative 'import_overlay'
 require_relative 'dialog_progress'
 require_relative 'visibility' rescue nil
 require_relative 'preview_layer' rescue nil
+require_relative 'overlay_renderer' rescue nil
 
 module PointCloudPlugin
   module UI
@@ -51,6 +53,7 @@ module PointCloudPlugin
         )
         @active_chunks = {}
         @chunk_usage = []
+        @overlay_sources = {}
         @snap_target = nil
         @frame_times = []
         @last_draw_time = nil
@@ -64,6 +67,7 @@ module PointCloudPlugin
         @auto_camera_active = true
         @camera_focused = false
         @memory_notice_expires_at = nil
+        @overlay_renderer = defined?(PointCloudPlugin::UI::OverlayRenderer) ? UI::OverlayRenderer.new : nil
         hook_settings
         setup_progress_dialog_bridge
         update_preview_controls_ui(
@@ -90,35 +94,40 @@ module PointCloudPlugin
         begin
           expire_memory_notice_if_needed
           update_fps
-          gather_chunks(view)
-          points_by_color = Hash.new { |hash, key| hash[key] = [] }
-          color_lookup = {}
+          overlay_points = draw_overlay(view)
+          if overlay_points.nil?
+            gather_chunks(view)
+            points_by_color = Hash.new { |hash, key| hash[key] = [] }
+            color_lookup = {}
 
-          @chunk_usage.each do |key|
-            entry = @active_chunks[key]
-            next unless entry
+            @chunk_usage.each do |key|
+              entry = @active_chunks[key]
+              next unless entry
 
-            chunk = entry[:chunk]
-            chunk.size.times do |index|
-              point = chunk.point_at(index)
-              bucket_key, color_value = color_bucket_for(point)
-              color_lookup[bucket_key] ||= color_value
-              points_by_color[bucket_key] << point[:position]
-            end
-          end
-
-          if view.respond_to?(:draw_points)
-            points_by_color.each do |color_key, positions|
-              color = color_for(color_key, color_lookup[color_key], default_color)
-
-              positions.each_slice(max_points_per_batch) do |batch|
-                sketchup_points = convert_positions_to_points(batch)
-                next if sketchup_points.empty?
-
-                points_drawn += sketchup_points.length
-                view.draw_points(sketchup_points, point_size, 1, color)
+              chunk = entry[:chunk]
+              chunk.size.times do |index|
+                point = chunk.point_at(index)
+                bucket_key, color_value = color_bucket_for(point)
+                color_lookup[bucket_key] ||= color_value
+                points_by_color[bucket_key] << point[:position]
               end
             end
+
+            if view.respond_to?(:draw_points)
+              points_by_color.each do |color_key, positions|
+                color = color_for(color_key, color_lookup[color_key], default_color)
+
+                positions.each_slice(max_points_per_batch) do |batch|
+                  sketchup_points = convert_positions_to_points(batch)
+                  next if sketchup_points.empty?
+
+                  points_drawn += sketchup_points.length
+                  view.draw_points(sketchup_points, point_size, 1, color)
+                end
+              end
+            end
+          else
+            points_drawn = overlay_points.to_i
           end
         rescue => e
           Kernel.puts("[PointCloudPlugin:draw] #{e.class}: #{e.message}\n  #{e.backtrace&.first}")
@@ -186,6 +195,7 @@ module PointCloudPlugin
       def begin_import_session(job:, cloud_id:, cloud_name: nil)
         @active_import_job = job
         @active_cloud_id = cloud_id
+        @overlay_sources.delete(cloud_id.to_s)
         @preview_buffer.clear
         @preview_ready = false
         @sample_ready = false
@@ -327,6 +337,175 @@ module PointCloudPlugin
       end
 
       private
+
+      def draw_overlay(view)
+        return nil unless overlay_renderer_active?
+
+        targets = collect_overlay_targets
+        return nil if targets.empty?
+
+        result = if @overlay_renderer.respond_to?(:draw)
+                   @overlay_renderer.draw(view, targets)
+                 end
+
+        interpret_overlay_result(result)
+      rescue => e
+        Kernel.puts("[PointCloudPlugin:overlay] #{e.class}: #{e.message}\n  #{e.backtrace&.first}")
+        nil
+      end
+
+      def overlay_renderer_active?
+        @overlay_renderer && overlay_renderer_enabled? && !import_in_progress?
+      end
+
+      def overlay_renderer_enabled?
+        @settings && @settings[:overlay_renderer_beta]
+      end
+
+      def interpret_overlay_result(result)
+        case result
+        when nil
+          nil
+        when Hash
+          handled = result.key?(:handled) ? !!result[:handled] : true
+          points = result[:points]
+          points = result[:points_drawn] if points.nil?
+          handled ? (points ? points.to_i : 0) : nil
+        when Integer
+          result
+        when Float
+          result.to_i
+        when true
+          0
+        else
+          nil
+        end
+      end
+
+      def update_overlay_renderer_state
+        return unless @overlay_renderer
+
+        if @overlay_renderer.respond_to?(:enabled=)
+          @overlay_renderer.enabled = !!overlay_renderer_enabled?
+        end
+      rescue StandardError
+        nil
+      end
+
+      def collect_overlay_targets
+        return [] unless manager
+
+        active_keys = []
+        targets = []
+
+        manager.each_cloud do |cloud|
+          key = overlay_cache_key(cloud.id)
+          active_keys << key
+          next if overlay_job_pending?(cloud.job)
+
+          data_source = overlay_data_source_for(cloud)
+          preview_groups = cached_preview_groups_for(cloud.id)
+
+          next unless data_source || preview_groups.any?
+
+          targets << {
+            id: cloud.id,
+            name: cloud.name,
+            data_source: data_source,
+            preview_groups: preview_groups
+          }
+        end
+
+        prune_overlay_sources(active_keys)
+        targets
+      end
+
+      def overlay_data_source_for(cloud)
+        return nil unless cloud
+
+        store = cloud.pipeline&.chunk_store
+        return nil unless store && store.respond_to?(:cache_path)
+
+        key = overlay_cache_key(cloud.id)
+        cache_path = store.cache_path
+        manifest = store.respond_to?(:manifest) ? store.manifest : nil
+
+        source = @overlay_sources[key]
+        if source && source.cache_path.to_s == cache_path.to_s
+          source.manifest = manifest if manifest
+          return source.refresh!
+        end
+
+        new_source = Core::OverlayDataSource.new(cache_path: cache_path, manifest: manifest)
+        new_source.refresh!
+        @overlay_sources[key] = new_source
+      rescue StandardError
+        nil
+      end
+
+      def overlay_cache_key(cloud_id)
+        cloud_id.to_s
+      end
+
+      def overlay_job_pending?(job)
+        return false unless job
+
+        status = job.respond_to?(:completion_status) ? job.completion_status : nil
+        status.nil? || status == :pending
+      rescue StandardError
+        true
+      end
+
+      def prune_overlay_sources(active_keys)
+        return unless @overlay_sources
+
+        active_set = active_keys.to_set
+        @overlay_sources.keys.each do |key|
+          next if active_set.include?(key)
+
+          @overlay_sources.delete(key)
+        end
+      end
+
+      def cached_preview_groups_for(cloud_id)
+        return [] unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+        model = Sketchup.active_model
+        return [] unless model&.respond_to?(:entities)
+
+        entities = model.entities
+        group_class = defined?(Sketchup::Group) ? Sketchup::Group : Object
+        dictionary = cpoints_constant(:ATTRIBUTE_DICTIONARY, 'pcimport')
+        type_key = cpoints_constant(:ATTRIBUTE_KEY_TYPE, 'type')
+        preview_value = cpoints_constant(:ATTRIBUTE_VALUE_PREVIEW, 'preview')
+        cloud_key = cpoints_constant(:ATTRIBUTE_KEY_CLOUD_ID, 'cloud_id')
+        cloud_token = cloud_id.to_s
+
+        entities.grep(group_class).each_with_object([]) do |entity, collection|
+          next unless entity.respond_to?(:get_attribute)
+
+          type = entity.get_attribute(dictionary, type_key)
+          next unless type && type.to_s == preview_value.to_s
+
+          owner = entity.get_attribute(dictionary, cloud_key)
+          next unless owner && owner.to_s == cloud_token
+
+          collection << entity
+        end
+      rescue StandardError
+        []
+      end
+
+      def cpoints_constant(name, fallback)
+        if defined?(PointCloudPlugin::UI::CPointsBuilder) &&
+           PointCloudPlugin::UI::CPointsBuilder.const_defined?(name)
+          PointCloudPlugin::UI::CPointsBuilder.const_get(name)
+        else
+          fallback
+        end
+      rescue NameError
+        fallback
+      end
 
       def setup_progress_dialog_bridge
         return unless import_overlay
@@ -648,6 +827,7 @@ module PointCloudPlugin
         update_hud_runtime_metrics(current_settings)
         import_overlay.update_settings(current_settings) if import_overlay.respond_to?(:update_settings)
         sync_preview_dialog_state
+        update_overlay_renderer_state
       end
 
       def update_hud_runtime_metrics(settings)

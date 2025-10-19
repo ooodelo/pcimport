@@ -47,7 +47,8 @@ module PointCloudPlugin
         prefetch_forward_threshold: PRESETS[DEFAULT_MODE][:prefetch_forward_threshold],
         preview_threshold: PRESETS[DEFAULT_MODE][:preview_threshold],
         preview_show_points: false,
-        preview_anchor_only: false
+        preview_anchor_only: false,
+        overlay_renderer_beta: false
       }.freeze
 
       IMPORT_UNITS = [
@@ -113,6 +114,7 @@ module PointCloudPlugin
         preview_disabled = preview_state[:available] ? '' : 'disabled'
         anchors_checked = preview_state[:anchors_only] ? 'checked' : ''
         anchors_disabled = (!preview_state[:available] || !preview_state[:show_points]) ? 'disabled' : ''
+        overlay_beta_checked = @settings[:overlay_renderer_beta] ? 'checked' : ''
 
         html = <<~HTML
           <html>
@@ -135,6 +137,9 @@ module PointCloudPlugin
                 .preview-controls label { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
                 .preview-controls label.nested { margin-left: 20px; font-weight: normal; }
                 .preview-controls .hint { font-size: 11px; color: #555; margin-top: 4px; }
+                .beta-controls { border-top: 1px dashed #d0d0d0; padding-top: 12px; margin-top: 12px; color: #555; }
+                .beta-controls label { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+                .beta-controls .hint { font-size: 11px; color: #888; margin: 0; }
               </style>
             </head>
             <body>
@@ -166,6 +171,10 @@ module PointCloudPlugin
                 <label class="nested"><input id="preview_anchor_toggle" type="checkbox" #{anchors_checked} #{anchors_disabled}> Только опорные точки</label>
                 <div class="hint" id="preview_hint">Точки появятся после подготовки выборки.</div>
               </div>
+              <div class="section beta-controls">
+                <label><input id="overlay_beta_toggle" type="checkbox" #{overlay_beta_checked} disabled> Рендер наложений (beta)</label>
+                <p class="hint">Экспериментальная функция. Включение станет доступно позже.</p>
+              </div>
               <div class="buttons">
                 <button id="apply_button" type="button">Применить</button>
                 <button id="cancel_button" type="button">Закрыть</button>
@@ -194,6 +203,7 @@ module PointCloudPlugin
                   const previewToggle = document.getElementById('preview_points_toggle');
                   const anchorToggle = document.getElementById('preview_anchor_toggle');
                   const previewHint = document.getElementById('preview_hint');
+                  const overlayToggle = document.getElementById('overlay_beta_toggle');
 
                   function updateDisplay() {
                     const value = parseFloat(slider.value);
@@ -267,7 +277,8 @@ module PointCloudPlugin
                       prefetch_forward_threshold: currentPrefetch.forwardThreshold,
                       preview_threshold: currentPrefetch.previewThreshold,
                       preview_show_points: previewState.available ? !!previewState.show_points : false,
-                      preview_anchor_only: previewState.available ? !!previewState.anchors_only : false
+                      preview_anchor_only: previewState.available ? !!previewState.anchors_only : false,
+                      overlay_renderer_beta: overlayToggle ? !!overlayToggle.checked : false
                     };
 
                     if (window.sketchup && typeof window.sketchup.apply === 'function') {
@@ -610,7 +621,8 @@ module PointCloudPlugin
           prefetch_forward_threshold: clamp_float(fetch_numeric(data, :prefetch_forward_threshold, customized ? forward_fallback : preset[:prefetch_forward_threshold]), -1.0, 1.0),
           preview_threshold: clamp_float(fetch_numeric(data, :preview_threshold, customized ? preview_fallback : preset[:preview_threshold]), 0.0, 1.0),
           preview_show_points: fetch_boolean(data, :preview_show_points, settings[:preview_show_points]),
-          preview_anchor_only: fetch_boolean(data, :preview_anchor_only, settings[:preview_anchor_only])
+          preview_anchor_only: fetch_boolean(data, :preview_anchor_only, settings[:preview_anchor_only]),
+          overlay_renderer_beta: fetch_boolean(data, :overlay_renderer_beta, settings[:overlay_renderer_beta])
         }
 
         normalized[:preview_anchor_only] = false unless normalized[:preview_show_points]

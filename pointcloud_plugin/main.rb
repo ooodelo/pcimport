@@ -31,6 +31,7 @@ PointCloudPlugin.log('Loading runtime (pointcloud_plugin/main.rb)') if defined?(
 require_relative 'core/units'
 require_relative 'core/chunk'
 require_relative 'core/chunk_store'
+require_relative 'core/overlay_data_source'
 require_relative 'core/manifest'
 require_relative 'core/project_cache_manager'
 require_relative 'core/readers/reader_base'
@@ -53,6 +54,7 @@ require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
 require_relative 'ui/import_overlay'
 require_relative 'ui/entry_points'
+require_relative 'ui/overlay_renderer'
 
 module PointCloudPlugin
   EXTENSION_ID ||= 'com.example.pointcloud'
