@@ -8,6 +8,7 @@ require_relative '../core/spatial/knn'
 require_relative '../core/spatial/frustum'
 require_relative 'hud'
 require_relative 'dialog_settings'
+require_relative 'import_overlay'
 require_relative 'visibility' rescue nil
 require_relative 'preview_layer' rescue nil
 
@@ -29,18 +30,27 @@ module PointCloudPlugin
         end
       end
 
-      attr_reader :manager, :hud, :settings_dialog
+      attr_reader :manager, :hud, :settings_dialog, :import_overlay
 
       def initialize(manager)
         @manager = manager
         @hud = Hud.new
         @settings_dialog = DialogSettings.new
         @settings = @settings_dialog.settings
+        @import_overlay = ImportOverlay.new
         @active_chunks = {}
         @chunk_usage = []
         @snap_target = nil
         @frame_times = []
         @last_draw_time = nil
+        @active_import_job = nil
+        @active_cloud_id = nil
+        @preview_buffer = []
+        @preview_ready = false
+        @visualization_announced = false
+        @auto_camera_active = true
+        @camera_focused = false
+        @memory_notice_expires_at = nil
         hook_settings
       end
 
@@ -58,6 +68,7 @@ module PointCloudPlugin
         default_color = default_point_color
 
         begin
+          expire_memory_notice_if_needed
           update_fps
           gather_chunks(view)
           points_by_color = Hash.new { |hash, key| hash[key] = [] }
@@ -94,12 +105,28 @@ module PointCloudPlugin
         ensure
           @last_drawn_point_count = points_drawn
           draw_snap(view, point_size)
+          handle_visualization_ready(points_drawn)
           PointCloud::UI::PreviewLayer.draw(view, self) if defined?(PointCloud::UI::PreviewLayer)
           hud.draw(view)
+          import_overlay.draw(view) if import_overlay
         end
       end
 
       def onMouseMove(_flags, x, y, view)
+        user_interaction!
+        update_snap_target(view, x, y)
+        view.invalidate if view.respond_to?(:invalidate)
+      end
+
+      def onLButtonDown(_flags, x, y, view)
+        user_interaction!
+
+        if import_overlay&.cancel_enabled? && import_overlay.cancel_hit?(x, y)
+          cancel_active_import
+          view.invalidate if view.respond_to?(:invalidate)
+          return
+        end
+
         update_snap_target(view, x, y)
         view.invalidate if view.respond_to?(:invalidate)
       end
@@ -112,7 +139,11 @@ module PointCloudPlugin
         limit = limit.to_i
         limit = 0 if limit.negative?
 
-        samples = gather_reservoir_samples(limit)
+        samples = preview_buffer_samples(limit)
+        remaining = limit.positive? ? [limit - samples.length, 0].max : nil
+
+        reservoir_samples = gather_reservoir_samples(remaining || limit)
+        samples.concat(reservoir_samples)
         remaining = limit.positive? ? [limit - samples.length, 0].max : nil
 
         if remaining.nil? || remaining.positive?
@@ -122,7 +153,239 @@ module PointCloudPlugin
         limit.positive? ? samples.first(limit) : samples
       end
 
+      def preview_ready=(value)
+        @preview_ready = !!value
+      end
+
+      def import_in_progress?
+        !@active_import_job.nil?
+      end
+
+      def begin_import_session(job:, cloud_id:, cloud_name: nil)
+        @active_import_job = job
+        @active_cloud_id = cloud_id
+        @preview_buffer.clear
+        @preview_ready = false
+        @visualization_announced = false
+        @camera_focused = false
+        @auto_camera_active = true
+        import_overlay.show!
+        update_import_state(:initializing)
+        hud.update(load_status: "Загрузка: инициализация", memory_notice: nil)
+        hud.update(points_on_screen: 0)
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def handle_import_state(job:, state:, stage_progress: nil)
+        return unless job && job == @active_import_job
+
+        update_import_state(state, stage_progress: stage_progress)
+      end
+
+      def handle_import_chunk(job:, key:, chunk:, info: {})
+        return unless job && job == @active_import_job
+        return unless chunk
+
+        hud.update(points_on_screen: chunk.size)
+        import_overlay.update_stage_progress(info[:stage_progress]) if info.is_a?(Hash)
+
+        ingest_preview_points(Array(info[:preview_points])) if info.is_a?(Hash) && info[:preview_points]
+        ingest_preview_chunk(chunk)
+
+        if info.is_a?(Hash) && info[:first_chunk] && @auto_camera_active && !@camera_focused
+          focused = PointCloudPlugin.focus_camera_on_chunk(chunk) if PointCloudPlugin.respond_to?(:focus_camera_on_chunk)
+          @camera_focused = true if focused
+        end
+
+        if info.is_a?(Hash) && info[:preview_ready]
+          @preview_ready = true
+        end
+
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def handle_import_completion(job)
+        return unless job && job == @active_import_job
+
+        status = job.respond_to?(:completion_status) ? job.completion_status : :completed
+
+        case status
+        when :cancelled
+          update_import_state(:cancelled)
+          hud.update(load_status: 'Импорт отменён пользователем')
+          if @active_cloud_id && PointCloudPlugin.respond_to?(:manager)
+            PointCloudPlugin.manager.remove_cloud(@active_cloud_id)
+          end
+        when :failed
+          update_import_state(:cancelled)
+          if @active_cloud_id && PointCloudPlugin.respond_to?(:manager)
+            PointCloudPlugin.manager.remove_cloud(@active_cloud_id)
+          end
+        else
+          update_import_state(:navigating)
+          hud.update(load_status: 'Первые точки готовы') unless @visualization_announced
+        end
+
+        @active_import_job = nil
+        @active_cloud_id = nil
+        @preview_buffer.clear
+        @preview_ready = false
+        @visualization_announced = false
+        @memory_notice_expires_at = nil
+        hud.update(memory_notice: nil)
+        import_overlay.hide!
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def cancel_active_import
+        return unless cancel_allowed?
+
+        job = @active_import_job
+        job.cancel if job.respond_to?(:cancel)
+        update_import_state(:cancelled)
+        hud.update(load_status: 'Отмена импорта…')
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def handle_memory_pressure(limit_bytes, freed_bytes)
+        message = format_memory_notice(limit_bytes, freed_bytes)
+        hud.update(memory_notice: message)
+        @memory_notice_expires_at = current_time + 5.0
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
       private
+
+      PREVIEW_BUFFER_LIMIT = 2_000
+
+      def preview_buffer_samples(limit)
+        return [] if limit.zero?
+
+        samples = @preview_buffer.dup
+        return samples if limit.negative? || limit.nil?
+
+        samples.first(limit)
+      end
+
+      def update_import_state(new_state, stage_progress: nil)
+        return unless import_overlay
+
+        import_overlay.show!
+        import_overlay.update_state(new_state)
+        import_overlay.update_stage_progress(stage_progress) if stage_progress
+
+        label = case new_state
+                when :initializing then 'Загрузка: инициализация'
+                when :reading then 'Загрузка: чтение'
+                when :preparing then 'Загрузка: подготовка данных'
+                when :visualizing then 'Загрузка: визуализация'
+                when :navigating then 'Работа: навигация'
+                when :cancelled then 'Загрузка отменена'
+                else
+                  'Загрузка облака…'
+                end
+
+        hud.update(load_status: label)
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def cancel_allowed?
+        import_overlay&.cancel_enabled? && @active_import_job
+      end
+
+      def format_memory_notice(limit_bytes, freed_bytes)
+        limit_mb = limit_bytes ? (limit_bytes.to_f / (1024.0 * 1024.0)).round : 0
+        freed_mb = freed_bytes.to_f / (1024.0 * 1024.0)
+        format('Ограничили память до %d МБ, освобождено %.1f МБ', limit_mb, freed_mb)
+      end
+
+      def current_time
+        if Process.const_defined?(:CLOCK_MONOTONIC)
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        else
+          Process.clock_gettime(:monotonic)
+        end
+      rescue Errno::EINVAL
+        Time.now.to_f
+      end
+
+      def expire_memory_notice_if_needed
+        return unless @memory_notice_expires_at
+
+        if current_time >= @memory_notice_expires_at
+          hud.update(memory_notice: nil)
+          @memory_notice_expires_at = nil
+        end
+      end
+
+      def ingest_preview_points(points)
+        return if points.nil? || @preview_ready
+
+        points.each do |point|
+          break if @preview_buffer.length >= PREVIEW_BUFFER_LIMIT
+
+          normalized = normalize_preview_point(point)
+          @preview_buffer << normalized if normalized
+        end
+      end
+
+      def normalize_preview_point(point)
+        if point.is_a?(Hash)
+          position = point[:position] || point['position']
+          return unless position
+
+          { position: Array(position)[0, 3] }
+        elsif point.respond_to?(:position)
+          { position: Array(point.position)[0, 3] }
+        elsif point.respond_to?(:to_a)
+          coords = point.to_a
+          return unless coords.length >= 3
+
+          { position: coords[0, 3] }
+        end
+      rescue StandardError
+        nil
+      end
+
+      def ingest_preview_chunk(chunk)
+        return if @preview_ready
+        return unless chunk.respond_to?(:each_point)
+
+        chunk.each_point do |point|
+          break if @preview_buffer.length >= PREVIEW_BUFFER_LIMIT
+
+          normalized = normalize_preview_point(point)
+          @preview_buffer << normalized if normalized
+        end
+      end
+
+      def handle_visualization_ready(points_drawn)
+        return unless points_drawn.positive?
+        return if @visualization_announced
+
+        @visualization_announced = true
+        hud.update(load_status: 'Первые точки готовы')
+        @preview_buffer.clear
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+          PointCloudPlugin.invalidate_active_view
+        end
+      end
+
+      def user_interaction!
+        @auto_camera_active = false
+      end
 
       def hook_settings
         settings_dialog.on_change do |new_settings|

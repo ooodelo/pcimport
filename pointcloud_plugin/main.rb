@@ -48,6 +48,7 @@ require_relative 'bridge/point_cloud_manager'
 require_relative 'ui/tool_pointcloud'
 require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
+require_relative 'ui/import_overlay'
 
 module PointCloudPlugin
   EXTENSION_ID ||= 'com.example.pointcloud'
@@ -99,6 +100,11 @@ module PointCloudPlugin
            end
     return unless path && !path.to_s.empty?
 
+    if tool.respond_to?(:import_in_progress?) && tool.import_in_progress?
+      tool.hud.update(load_status: 'Импорт уже выполняется')
+      return
+    end
+
     import_defaults = tool.settings_dialog.import_options
 
     if defined?(::UI) && ::UI.const_defined?(:HtmlDialog)
@@ -125,23 +131,24 @@ module PointCloudPlugin
     job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
 
     activate_tool
-    tool.hud.update(load_status: 'Loading point cloud...')
+    tool.hud.update(load_status: 'Загрузка: инициализация')
 
-    job.instance_variable_set(:@preview_initialized, false)
-    job.define_singleton_method(:on_chunk) do |key, chunk, info = {}|
-      PointCloudPlugin.tool.hud.update(last_chunk: key, last_points: chunk.size)
-      PointCloudPlugin.activate_tool
-
-      first_chunk = info.is_a?(Hash) ? info[:first_chunk] : false
-      unless @preview_initialized
-        if first_chunk && PointCloudPlugin.focus_camera_on_chunk(chunk)
-          @preview_initialized = true
+    chunk_store.on_memory_pressure do |freed_bytes, limit_bytes|
+      manager.queue.push do
+        if tool.respond_to?(:handle_memory_pressure)
+          tool.handle_memory_pressure(limit_bytes, freed_bytes)
         end
       end
     end
 
-    id = manager.register_cloud(name: File.basename(path), pipeline: pipeline, job: job)
-    tool.hud.update("cloud_#{id}" => File.basename(path))
+    cloud_name = File.basename(path)
+    id = manager.register_cloud(name: cloud_name, pipeline: pipeline, job: job)
+    job.cloud_id = id if job.respond_to?(:cloud_id=)
+
+    if tool.respond_to?(:begin_import_session)
+      tool.begin_import_session(job: job, cloud_id: id, cloud_name: cloud_name)
+    end
+    tool.hud.update("cloud_#{id}" => cloud_name)
 
     begin
       apply_runtime_settings(runtime_settings)
@@ -149,8 +156,12 @@ module PointCloudPlugin
       log("Failed to apply runtime settings: #{e.class}: #{e.message}")
     end
 
-    job.start do
-      tool.hud.update(status: 'Import complete')
+    job.start do |completed_job|
+      if tool.respond_to?(:handle_import_completion)
+        tool.handle_import_completion(completed_job)
+      else
+        tool.hud.update(load_status: 'Import complete')
+      end
     end
   end
 
