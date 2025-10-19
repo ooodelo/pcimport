@@ -229,6 +229,15 @@ module PointCloudPlugin
     status_text = reuse_cache ? 'Кэш загружен' : 'Загрузка: инициализация'
     tool.hud.update(load_status: status_text)
 
+    if reuse_cache
+      payload = cache_manager.cache_hit_payload(cache_path: cache_path, manifest: manifest)
+      manager.queue.push do
+        if tool.respond_to?(:handle_import_payload)
+          tool.handle_import_payload(job: nil, payload: payload)
+        end
+      end
+    end
+
     if job
       if tool.respond_to?(:begin_import_session)
         tool.begin_import_session(job: job, cloud_id: id, cloud_name: cloud_name)

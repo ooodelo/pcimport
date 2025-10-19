@@ -5,6 +5,7 @@ require_relative '../core/chunk'
 require_relative '../core/chunk_store'
 require_relative '../core/file_hasher'
 require_relative '../core/lod/pipeline'
+require_relative '../core/sample_cache'
 require_relative '../core/sampling/voxel_reservoir_sampler'
 require_relative 'main_thread_queue'
 require_relative '../ui/cpoints_builder'
@@ -15,11 +16,6 @@ module PointCloudPlugin
     class ImportJob
       DEFAULT_PREVIEW_THRESHOLD = 0.12
       STREAMING_COMPATIBILITY_FLAG = 'PCIMPORT_STREAMING_COMPAT'
-      SAMPLE_FILE_NAME = 'sample_300k.bin'
-      SAMPLE_MAGIC = 'PCS1'.b
-      SAMPLE_VERSION = 1
-      SAMPLE_FLAG_HAS_COLOR = 0x01
-      SAMPLE_FLAG_HAS_ANCHOR = 0x02
 
       attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
       attr_accessor :cloud_id
@@ -43,6 +39,12 @@ module PointCloudPlugin
         @pending_preview_activation = false
         @suppress_view_updates = true
         @geometry_ready_notified = false
+        @sample_ready = false
+        @anchors_ready = false
+        @cache_hit = false
+        @stage_durations = Hash.new(0.0)
+        @stage_start_time = nil
+        @last_error_info = nil
       end
 
       def start(&block)
@@ -77,8 +79,16 @@ module PointCloudPlugin
         size_in_bytes = file_size_bytes
         estimated_total = estimate_total_points(size_in_bytes)
         @start_time = monotonic_time
+        @stage_start_time = @start_time
         @last_log_time = @start_time
         @last_logged_percent = 0.0
+        @stage_durations = Hash.new(0.0)
+        default_stage_progress.each_key { |stage| @stage_durations[stage] = 0.0 }
+        @stage_durations[:initializing] ||= 0.0
+        @cache_hit = false
+        @sample_ready = false
+        @anchors_ready = false
+        @last_error_info = nil
 
         log_start(size_in_bytes, estimated_total)
         perform_import(
@@ -142,18 +152,26 @@ module PointCloudPlugin
           log_progress(total_points, estimated_total, progress_percent, elapsed, bytes_processed)
 
           queue.push do
-            info = {
+            info = build_status_payload(
+              total_points: total_points,
+              estimated_total: estimated_total,
+              progress_percent: progress_percent,
+              first_chunk: first_chunk,
+              preview_points: preview_points
+            )
+
+            notify_progress(
+              key,
+              chunk,
               total_points: total_points,
               estimated_total: estimated_total,
               progress_percent: progress_percent,
               first_chunk: first_chunk,
               preview_ready: preview_ready?,
-              stage: state,
-              stage_progress: @stage_progress.dup,
+              stage: info[:stage],
+              stage_progress: info[:stage_progress],
               preview_points: preview_points
-            }
-
-            notify_progress(key, chunk, **info)
+            )
             dispatch_to_tool(key, chunk, info) if streaming
 
             update_hud_progress(
@@ -190,6 +208,13 @@ module PointCloudPlugin
         transition_state(:navigating)
 
         queue.push do
+          payload = build_status_payload(
+            total_points: total_points,
+            estimated_total: estimated_total,
+            progress_percent: 100.0
+          )
+          dispatch_payload(payload)
+
           update_hud_progress(
             total_points,
             estimated_total,
@@ -235,6 +260,11 @@ module PointCloudPlugin
         manifest.update_source_signature!(signature)
         manifest.ensure_chunk_inventory!
 
+        cache_path = manifest.respond_to?(:cache_path) ? manifest.cache_path : nil
+        metadata = Core::SampleCache.metadata(cache_path)
+        update_sample_flags(sample_ready: metadata[:sample_ready], anchors_ready: metadata[:anchors_ready])
+        @cache_hit = true
+
         total_points = 0
         preview_accumulator = []
 
@@ -269,18 +299,25 @@ module PointCloudPlugin
           next unless streaming
 
           queue.push do
-            info = {
+            info = build_status_payload(
+              total_points: total_points,
+              estimated_total: estimated_total,
+              progress_percent: progress_percent,
+              first_chunk: index.zero?
+            )
+
+            notify_progress(
+              key,
+              chunk,
               total_points: total_points,
               estimated_total: estimated_total,
               progress_percent: progress_percent,
               first_chunk: index.zero?,
               preview_ready: preview_ready?,
-              stage: state,
-              stage_progress: @stage_progress.dup,
+              stage: info[:stage],
+              stage_progress: info[:stage_progress],
               preview_points: nil
-            }
-
-            notify_progress(key, chunk, **info)
+            )
             dispatch_to_tool(key, chunk, info)
 
             update_hud_progress(
@@ -318,6 +355,13 @@ module PointCloudPlugin
         transition_state(:navigating)
 
         queue.push do
+          payload = build_status_payload(
+            total_points: total_points,
+            estimated_total: estimated_total,
+            progress_percent: 100.0
+          )
+          dispatch_payload(payload)
+
           update_hud_progress(
             total_points,
             estimated_total,
@@ -380,12 +424,12 @@ module PointCloudPlugin
         has_anchor = samples.any?(&:anchor)
 
         flags = 0
-        flags |= SAMPLE_FLAG_HAS_COLOR if has_color
-        flags |= SAMPLE_FLAG_HAS_ANCHOR if has_anchor
+        flags |= Core::SampleCache::FLAG_HAS_COLOR if has_color
+        flags |= Core::SampleCache::FLAG_HAS_ANCHOR if has_anchor
 
         header = [
-          SAMPLE_MAGIC,
-          SAMPLE_VERSION,
+          Core::SampleCache::SAMPLE_MAGIC,
+          Core::SampleCache::SAMPLE_VERSION,
           samples.length,
           flags
         ].pack('a4 S< L< L<')
@@ -414,8 +458,10 @@ module PointCloudPlugin
           payload << [sample.anchor ? 1 : 0].pack('C')
         end
 
-        path = File.join(cache_path, SAMPLE_FILE_NAME)
+        path = File.join(cache_path, Core::SampleCache::SAMPLE_FILE_NAME)
         File.binwrite(path, header + payload)
+
+        update_sample_flags(sample_ready: true, anchors_ready: has_anchor)
 
         if (manifest = store&.manifest)
           anchors = manifest.anchors
@@ -424,7 +470,7 @@ module PointCloudPlugin
           manifest.write!
         end
       rescue StandardError => e
-        warn("Failed to write #{SAMPLE_FILE_NAME}: #{e.message}")
+        warn("Failed to write #{Core::SampleCache::SAMPLE_FILE_NAME}: #{e.message}")
       end
 
       def write_preview_sample(points)
@@ -576,34 +622,11 @@ module PointCloudPlugin
         cache_path = store&.cache_path
         return [] unless cache_path
 
-        path = File.join(cache_path, SAMPLE_FILE_NAME)
-        return [] unless File.file?(path)
+        metadata = Core::SampleCache.metadata(cache_path)
+        update_sample_flags(sample_ready: metadata[:sample_ready], anchors_ready: metadata[:anchors_ready])
+        return [] unless metadata[:sample_ready]
 
-        data = File.binread(path)
-        return [] unless data && data.bytesize >= 14
-
-        header = data[0, 14].unpack('a4 S< L< L<')
-        magic, version, count, flags = header
-        return [] unless magic == SAMPLE_MAGIC && version == SAMPLE_VERSION
-
-        has_color = (flags & SAMPLE_FLAG_HAS_COLOR).positive?
-        offset = 14
-        record_size = 12 + (has_color ? 3 : 0) + 1
-        samples = []
-
-        count.times do
-          break if offset + record_size > data.bytesize
-
-          coords = data[offset, 12].unpack('e3')
-          offset += 12
-          offset += 3 if has_color
-          anchor_flag = data.getbyte(offset) || 0
-          offset += 1
-
-          samples << { position: coords, anchor: anchor_flag.positive? }
-        end
-
-        samples
+        Core::SampleCache.read_samples(cache_path, limit: PREVIEW_SAMPLE_LIMIT)
       rescue StandardError => e
         warn("Failed to load cached preview samples: #{e.message}")
         []
@@ -679,6 +702,132 @@ module PointCloudPlugin
 
       def preview_ready?
         @preview_ready
+      end
+
+      def sample_ready?
+        @sample_ready
+      end
+
+      def anchors_ready?
+        @anchors_ready
+      end
+
+      def cache_hit?
+        @cache_hit
+      end
+
+      def build_status_payload(overrides = {})
+        payload = {
+          stage: @state,
+          stage_progress: @stage_progress.dup,
+          cache_hit: cache_hit?,
+          sample_ready: sample_ready?,
+          anchors_ready: anchors_ready?,
+          timings: timings_snapshot,
+          error: @last_error_info,
+          preview_ready: preview_ready?,
+          completion_status: @completion_status
+        }
+
+        if overrides.is_a?(Hash)
+          overrides.each do |key, value|
+            next if value.nil?
+
+            payload[key] = value
+          end
+        end
+
+        payload
+      end
+
+      def timings_snapshot
+        now = monotonic_time
+        durations = {}
+
+        @stage_durations.each do |stage, value|
+          durations[stage] = value.to_f
+        end
+
+        if @stage_start_time && @state
+          elapsed = now - @stage_start_time
+          durations[@state] = durations.fetch(@state, 0.0) + (elapsed.positive? ? elapsed : 0.0)
+        end
+
+        default_stage_progress.keys.each do |stage|
+          durations[stage] = durations.fetch(stage, 0.0)
+        end
+
+        total = if @start_time
+                  now - @start_time
+                else
+                  durations.values.sum
+                end
+
+        total = 0.0 unless total&.positive?
+
+        { total: total.to_f, stages: durations }
+      end
+
+      def update_sample_flags(sample_ready: nil, anchors_ready: nil)
+        changed = false
+
+        unless sample_ready.nil?
+          normalized = !!sample_ready
+          if @sample_ready != normalized
+            @sample_ready = normalized
+            changed = true
+          end
+        end
+
+        unless anchors_ready.nil?
+          normalized = !!anchors_ready && @sample_ready
+          if @anchors_ready != normalized
+            @anchors_ready = normalized
+            changed = true
+          end
+        end
+
+        if !@sample_ready && @anchors_ready
+          @anchors_ready = false
+          changed = true
+        end
+
+        changed
+      end
+
+      def record_stage_duration(stage)
+        now = monotonic_time
+        if stage && @stage_start_time
+          elapsed = now - @stage_start_time
+          @stage_durations[stage] += elapsed if elapsed.positive?
+        end
+        now
+      end
+
+      def capture_error_info(error)
+        return nil unless error
+
+        info = {
+          class: error.class.name,
+          message: error.message.to_s
+        }
+
+        backtrace = Array(error.backtrace).first(5)
+        info[:backtrace] = backtrace if backtrace.any?
+
+        @last_error_info = info
+      end
+
+      def dispatch_payload(payload)
+        tool = active_tool
+        return unless tool
+        return unless payload.is_a?(Hash)
+
+        if tool.respond_to?(:handle_import_payload)
+          tool.handle_import_payload(job: self, payload: payload)
+        end
+      rescue StandardError => e
+        warn("Failed to dispatch payload: #{e.message}")
       end
 
       def estimate_total_points(size_in_bytes = nil)
@@ -929,6 +1078,8 @@ module PointCloudPlugin
           @preview_ready = true
         end
 
+        update_sample_flags(sample_ready: true) if @preview_ready
+
         @preview_ready
       end
 
@@ -989,15 +1140,23 @@ module PointCloudPlugin
         new_state = new_state.to_sym
         return if @state == new_state
 
+        timestamp = record_stage_duration(@state)
         @state = new_state
+        @stage_durations[@state] ||= 0.0
+        @stage_start_time = timestamp
         queue.push { dispatch_state_change(new_state) }
       end
 
       def dispatch_state_change(new_state)
         tool = active_tool
-        return unless tool && tool.respond_to?(:handle_import_state)
+        return unless tool
 
-        tool.handle_import_state(job: self, state: new_state, stage_progress: @stage_progress.dup)
+        payload = build_status_payload(stage: new_state)
+        dispatch_payload(payload)
+
+        if tool.respond_to?(:handle_import_state)
+          tool.handle_import_state(job: self, state: new_state, stage_progress: payload[:stage_progress])
+        end
       end
 
       def dispatch_to_tool(key, chunk, info)
@@ -1005,6 +1164,8 @@ module PointCloudPlugin
         return unless tool
 
         PointCloudPlugin.activate_tool if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:activate_tool)
+
+        dispatch_payload(info)
 
         if tool.respond_to?(:handle_import_state)
           tool.handle_import_state(job: self, state: info[:stage] || state, stage_progress: info[:stage_progress])
@@ -1052,6 +1213,13 @@ module PointCloudPlugin
         resume_view_updates
 
         queue.push do
+          payload = build_status_payload(
+            total_points: total_points,
+            estimated_total: estimated_total,
+            progress_percent: nil
+          )
+          dispatch_payload(payload)
+
           update_hud_progress(total_points, estimated_total, nil, elapsed: elapsed, bytes_processed: bytes_processed)
           flush_pending_preview_activation
           flush_pending_view_invalidation
@@ -1064,7 +1232,11 @@ module PointCloudPlugin
         @completion_status = :failed
         transition_state(:cancelled)
         resume_view_updates
+        capture_error_info(error)
         queue.push do
+          payload = build_status_payload
+          dispatch_payload(payload)
+
           update_hud_failure(error)
           flush_pending_preview_activation
           flush_pending_view_invalidation
