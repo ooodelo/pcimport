@@ -69,6 +69,30 @@ module PointCloud
         assert_equal 1, call[:style]
         assert_equal :color, call[:color]
       end
+
+      def test_extract_point_accepts_hash_with_string_keys
+        sample = { 'position' => [1.0, 2.0, 3.0, 4.0] }
+
+        assert_equal [1.0, 2.0, 3.0], PreviewLayer.extract_point(sample)
+      end
+
+      def test_extract_point_accepts_struct_samples
+        sample = Struct.new(:position).new([3.0, 2.0, 1.0])
+
+        assert_equal [3.0, 2.0, 1.0], PreviewLayer.extract_point(sample)
+      end
+
+      def test_extract_point_accepts_xyz_like_objects
+        sample = Struct.new(:x, :y, :z).new(5.0, 6.0, 7.0)
+
+        assert_equal [5.0, 6.0, 7.0], PreviewLayer.extract_point(sample)
+      end
+
+      def test_extract_point_accepts_raw_coordinate_arrays
+        sample = [8.0, 9.0, 10.0, 11.0]
+
+        assert_equal [8.0, 9.0, 10.0], PreviewLayer.extract_point(sample)
+      end
     end
   end
 end
