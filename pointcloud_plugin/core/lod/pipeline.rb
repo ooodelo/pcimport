@@ -20,6 +20,8 @@ module PointCloudPlugin
           @index_builder = Spatial::IndexBuilder.new(chunk_store)
           @chunk_nodes = {}
           @budget = 1
+          @lod_cache = Hash.new { |hash, key| hash[key] = {} }
+          register_chunk_store_callbacks
         end
 
         def submit_chunk(key, chunk)
@@ -27,6 +29,7 @@ module PointCloudPlugin
           node = index_builder.add_chunk(key, chunk)
           @chunk_nodes[key] = node
           update_reservoir(node, chunk)
+          clear_lod_cache_for(key)
         end
 
         def next_chunks(frame_budget: @budget, frustum: nil, camera_position: nil)
@@ -97,11 +100,23 @@ module PointCloudPlugin
             next if requested_points <= 0
 
             chunk = chunk_store.fetch(key)
-            next unless chunk
+            unless chunk
+              clear_lod_cache_for(key)
+              next
+            end
 
-            sampled = downsample_chunk(chunk, requested_points)
+            sampled = fetch_or_store_lod_chunk(key, requested_points) do
+              downsample_chunk(chunk, requested_points)
+            end
             list << [key, sampled]
           end
+        end
+
+        def fetch_or_store_lod_chunk(key, requested_points)
+          cache = @lod_cache[key]
+          return cache[requested_points] if cache.key?(requested_points)
+
+          cache[requested_points] = yield
         end
 
         def downsample_chunk(chunk, target_points)
@@ -159,6 +174,20 @@ module PointCloudPlugin
           return unless node
 
           reservoir.update_node(node.id, chunk.each_point)
+        end
+
+        def register_chunk_store_callbacks
+          return unless chunk_store.respond_to?(:on_remove)
+
+          chunk_store.on_remove do |key|
+            clear_lod_cache_for(key)
+          end
+        end
+
+        def clear_lod_cache_for(key)
+          return unless key
+
+          @lod_cache.delete(key)
         end
       end
     end

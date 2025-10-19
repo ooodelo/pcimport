@@ -67,6 +67,18 @@ module PointCloudPlugin
           assert_equal [2, 2], chunks.map { |(_, chunk)| chunk.size }.sort
         end
 
+        def test_reuses_cached_downsample_for_same_request
+          submit_chunk('dense', size: 120, center: [0, 0, 0])
+
+          first = @pipeline.next_chunks(frame_budget: 10, camera_position: [0, 0, 0])
+          second = @pipeline.next_chunks(frame_budget: 10, camera_position: [0, 0, 0])
+
+          refute_empty first
+          assert_equal ['dense'], first.map(&:first)
+          assert_equal 10, first.first.last.size
+          assert_same first.first.last, second.first.last
+        end
+
         private
 
         def submit_chunk(key, size:, center: [0, 0, 0])
