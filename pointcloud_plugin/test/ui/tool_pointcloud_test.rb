@@ -103,14 +103,34 @@ module PointCloudPlugin
       end
 
       class FakeView
-        attr_reader :camera
+        ScreenPoint = Struct.new(:x, :y, :z)
+
+        attr_reader :camera, :vpwidth, :vpheight
 
         def initialize(modelview, projection, eye = [0.0, 0.0, 0.0])
           @camera = FakeCamera.new(modelview, projection, eye)
+          @vpwidth = 800
+          @vpheight = 600
         end
 
         def pickray(_x, _y)
           [[0.0, 0.0, 10.0], [0.0, 0.0, -1.0]]
+        end
+
+        def screen_coords(point)
+          coords =
+            if point.is_a?(Array)
+              point
+            elsif point.respond_to?(:to_a)
+              point.to_a
+            elsif point.respond_to?(:x) && point.respond_to?(:y) && point.respond_to?(:z)
+              [point.x, point.y, point.z]
+            end
+
+          return ScreenPoint.new(0, 0, -1) unless coords && coords.length >= 3
+
+          x, y, z = coords
+          ScreenPoint.new(@vpwidth / 2.0 + x * 100.0, @vpheight / 2.0 - y * 100.0, -z)
         end
       end
 
@@ -118,7 +138,7 @@ module PointCloudPlugin
         projection = identity_matrix
         modelview = identity_matrix
         view = FakeView.new(modelview, projection)
-        invisible_chunk = FakeChunk.new({ bounds: { min: [2.0, -0.5, -0.5], max: [3.0, 0.5, 0.5] } })
+        invisible_chunk = FakeChunk.new({ bounds: { min: [-0.5, -0.5, 1.0], max: [0.5, 0.5, 2.0] } })
         pipeline = FakePipeline.new([['chunk', invisible_chunk]])
         prefetcher = FakePrefetcher.new
         cloud = FakeCloud.new(1, pipeline, prefetcher)
@@ -130,6 +150,23 @@ module PointCloudPlugin
         assert_empty tool.instance_variable_get(:@active_chunks)
         assert_equal 1, prefetcher.frustums.size
         assert_equal 6, prefetcher.frustums.first.planes.size
+      end
+
+      def test_visible_chunk_is_rendered
+        projection = identity_matrix
+        modelview = identity_matrix
+        view = FakeView.new(modelview, projection)
+        visible_chunk = FakeChunk.new({ bounds: { min: [-0.5, -0.5, -2.0], max: [0.5, 0.5, -1.0] } })
+        pipeline = FakePipeline.new([['chunk', visible_chunk]])
+        prefetcher = FakePrefetcher.new
+        cloud = FakeCloud.new(1, pipeline, prefetcher)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+        tool.send(:gather_chunks, view)
+
+        refute_empty tool.instance_variable_get(:@active_chunks)
+        assert_equal visible_chunk, tool.instance_variable_get(:@active_chunks)['chunk'][:chunk]
       end
 
       def test_update_snap_target_uses_reservoir_samples
