@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
 require 'json'
-require 'digest'
 require 'fileutils'
 
 require_relative 'chunk_serializer'
+require_relative 'file_hasher'
 
 module PointCloudPlugin
   module Core
@@ -81,7 +81,14 @@ module PointCloudPlugin
       def update_source!(source_path)
         return unless source_path && File.exist?(source_path)
 
-        @data['source'] = build_source_metadata(source_path)
+        signature = build_source_metadata(source_path)
+        update_source_signature!(signature)
+      end
+
+      def update_source_signature!(signature)
+        return unless signature.is_a?(Hash)
+
+        @data['source'] = deep_stringify(signature)
       end
 
       def valid_for?(source_path)
@@ -91,9 +98,7 @@ module PointCloudPlugin
         current = source
 
         return false unless current
-        return false unless current['hash'] == expected['hash']
-        return false unless current['size'] == expected['size']
-        return false unless current['mtime'] == expected['mtime']
+        return false unless FileHasher.signatures_match?(current, expected)
 
         chunks.all? do |filename|
           File.exist?(File.join(cache_path, filename))
@@ -199,12 +204,7 @@ module PointCloudPlugin
       end
 
       def build_source_metadata(source_path)
-        stat = File.stat(source_path)
-        {
-          'hash' => Digest::SHA256.file(source_path).hexdigest,
-          'size' => stat.size,
-          'mtime' => stat.mtime.to_f
-        }
+        FileHasher.signature_for(source_path)
       end
     end
   end

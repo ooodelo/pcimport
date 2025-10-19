@@ -3,6 +3,7 @@
 require 'securerandom'
 require_relative '../core/chunk'
 require_relative '../core/chunk_store'
+require_relative '../core/file_hasher'
 require_relative '../core/lod/pipeline'
 require_relative 'main_thread_queue'
 
@@ -11,6 +12,7 @@ module PointCloudPlugin
     # Handles background import of point cloud files and forwards chunks to the core pipeline.
     class ImportJob
       DEFAULT_PREVIEW_THRESHOLD = 0.12
+      STREAMING_COMPATIBILITY_FLAG = 'PCIMPORT_STREAMING_COMPAT'
 
       attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
       attr_accessor :cloud_id
@@ -27,9 +29,10 @@ module PointCloudPlugin
         @preview_ready = false
         @state = :initializing
         @completion_status = :pending
-        @stage_progress = { reading: 0.0, preparing: 0.0, visualizing: 0.0 }
+        @stage_progress = default_stage_progress
         @cancelled = false
         @preview_activation_ratio = DEFAULT_PREVIEW_THRESHOLD
+        @pending_view_invalidation = false
       end
 
       def start(&block)
@@ -51,8 +54,16 @@ module PointCloudPlugin
 
       private
 
+      def default_stage_progress
+        {
+          hash_check: 0.0,
+          sampling: 0.0,
+          cache_write: 0.0,
+          build: 0.0
+        }
+      end
+
       def run
-        total_points = 0
         size_in_bytes = file_size_bytes
         estimated_total = estimate_total_points(size_in_bytes)
         @start_time = monotonic_time
@@ -60,29 +71,56 @@ module PointCloudPlugin
         @last_logged_percent = 0.0
 
         log_start(size_in_bytes, estimated_total)
-        transition_state(:reading)
+        perform_import(
+          size_in_bytes: size_in_bytes,
+          estimated_total: estimated_total,
+          streaming: streaming_compatibility_enabled?
+        )
+      rescue StandardError => e
+        handle_failure(e)
+      end
+
+      def perform_import(size_in_bytes:, estimated_total:, streaming: false)
+        signature = perform_hash_check
+        manifest = pipeline&.chunk_store&.manifest
+
+        if manifest && signature && reuse_cache_from_manifest(
+             manifest,
+             signature,
+             size_in_bytes: size_in_bytes,
+             estimated_total: estimated_total,
+             streaming: streaming
+           )
+          return
+        end
+
+        manifest.update_source_signature!(signature) if manifest && signature
+
+        total_points = 0
+        preview_accumulator = []
+        transition_state(:sampling)
 
         reader.each_batch do |batch|
           break if cancelled?
 
           preview_points = preview_sample(batch)
+          append_preview_samples(preview_accumulator, preview_points)
+
           batch_points = batch.respond_to?(:size) ? batch.size : Array(batch).size
           total_points += batch_points
           ratio = progress_ratio(total_points, estimated_total)
-          update_stage_progress(:reading, ratio)
+          update_stage_progress(:sampling, ratio)
 
           chunk = pack(batch)
           first_chunk = (@chunk_index.zero?)
-          transition_state(:preparing) if first_chunk
-          update_stage_progress(:preparing, ratio)
+          transition_state(:cache_write) if first_chunk
+          update_stage_progress(:cache_write, ratio)
 
           break if cancelled?
 
           key = next_key
           pipeline.submit_chunk(key, chunk)
           preview_became_ready = mark_preview_ready(first_chunk: first_chunk, ratio: ratio)
-          transition_state(:visualizing) if preview_became_ready
-          update_stage_progress(:visualizing, ratio) if preview_ready?
 
           @progress = total_points
 
@@ -104,7 +142,7 @@ module PointCloudPlugin
             }
 
             notify_progress(key, chunk, **info)
-            dispatch_to_tool(key, chunk, info)
+            dispatch_to_tool(key, chunk, info) if streaming
 
             update_hud_progress(
               total_points,
@@ -115,14 +153,21 @@ module PointCloudPlugin
             )
 
             activate_preview_layer if preview_became_ready
-            invalidate_active_view
+            @pending_view_invalidation = true
           end
         end
+
+        transition_state(:cache_write) if state == :sampling
 
         if cancelled?
           handle_cancellation(total_points, estimated_total, size_in_bytes)
           return
         end
+
+        write_preview_sample(preview_accumulator)
+
+        transition_state(:build)
+        update_stage_progress(:build, 1.0)
 
         elapsed = elapsed_time
         @completion_status = :completed
@@ -138,10 +183,245 @@ module PointCloudPlugin
             elapsed: elapsed,
             bytes_processed: size_in_bytes
           )
+          flush_pending_view_invalidation
           @on_complete&.call(self)
         end
+      end
+
+      def perform_hash_check
+        transition_state(:hash_check)
+        update_stage_progress(:hash_check, 0.0)
+
+        signature = Core::FileHasher.signature_for(path)
+
+        update_stage_progress(:hash_check, 1.0)
+        signature
+      end
+
+      def streaming_compatibility_enabled?
+        value = ENV.fetch(STREAMING_COMPATIBILITY_FLAG, nil)
+        return false if value.nil?
+
+        normalized = value.to_s.strip.downcase
+        return false if normalized.empty?
+
+        !%w[0 false no off].include?(normalized)
+      rescue StandardError
+        false
+      end
+
+      def reuse_cache_from_manifest(manifest, signature, size_in_bytes:, estimated_total:, streaming: false)
+        return false unless signature.is_a?(Hash)
+
+        current = manifest.source
+        return false unless current
+        return false unless Core::FileHasher.signatures_match?(current, signature)
+
+        manifest.update_source_signature!(signature)
+        manifest.ensure_chunk_inventory!
+
+        total_points = 0
+        preview_accumulator = []
+
+        transition_state(:sampling)
+
+        Array(manifest.chunks).each_with_index do |filename, index|
+          break if cancelled?
+
+          key = File.basename(filename, File.extname(filename))
+          chunk = pipeline&.chunk_store&.fetch(key)
+          next unless chunk
+
+          pipeline.submit_chunk(key, chunk)
+
+          points_in_chunk = chunk.respond_to?(:size) ? chunk.size : 0
+          total_points += points_in_chunk
+
+          append_preview_samples(preview_accumulator, sample_from_chunk(chunk, PREVIEW_SAMPLE_LIMIT))
+
+          ratio = progress_ratio(total_points, estimated_total)
+          update_stage_progress(:sampling, ratio)
+          transition_state(:cache_write) if state == :sampling
+          update_stage_progress(:cache_write, ratio)
+
+          @preview_ready = true if points_in_chunk.positive?
+
+          progress_percent = ratio.positive? ? (ratio * 100.0) : nil
+          elapsed = elapsed_time
+          bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
+          log_progress(total_points, estimated_total, progress_percent, elapsed, bytes_processed)
+
+          next unless streaming
+
+          queue.push do
+            info = {
+              total_points: total_points,
+              estimated_total: estimated_total,
+              progress_percent: progress_percent,
+              first_chunk: index.zero?,
+              preview_ready: preview_ready?,
+              stage: state,
+              stage_progress: @stage_progress.dup,
+              preview_points: nil
+            }
+
+            notify_progress(key, chunk, **info)
+            dispatch_to_tool(key, chunk, info)
+
+            update_hud_progress(
+              total_points,
+              estimated_total,
+              progress_percent,
+              elapsed: elapsed,
+              bytes_processed: bytes_processed
+            )
+
+          activate_preview_layer if preview_ready?
+          @pending_view_invalidation = true
+        end
+        end
+
+        transition_state(:cache_write) if state == :sampling
+
+        @progress = total_points
+
+        if cancelled?
+          handle_cancellation(total_points, estimated_total, size_in_bytes)
+          return true
+        end
+
+        write_preview_sample(preview_accumulator)
+
+        transition_state(:build)
+        update_stage_progress(:build, 1.0)
+
+        elapsed = elapsed_time
+        @completion_status = :completed
+        finalize_stage_completion
+        log_completion(total_points, elapsed, size_in_bytes)
+        transition_state(:navigating)
+
+        queue.push do
+          update_hud_progress(
+            total_points,
+            estimated_total,
+            100.0,
+            elapsed: elapsed,
+            bytes_processed: size_in_bytes
+          )
+          flush_pending_view_invalidation
+          @on_complete&.call(self)
+        end
+
+        true
+      end
+
+      def append_preview_samples(storage, samples)
+        return unless storage.is_a?(Array)
+
+        remaining = PREVIEW_SAMPLE_LIMIT - storage.length
+        return if remaining <= 0
+
+        Array(samples).each do |sample|
+          break if remaining <= 0
+
+          storage << (sample.is_a?(Hash) ? sample.dup : sample)
+          remaining -= 1
+        end
+      rescue StandardError
+        nil
+      end
+
+      def sample_from_chunk(chunk, limit)
+        return [] unless chunk.respond_to?(:each_point)
+
+        samples = []
+        chunk.each_point do |point|
+          samples << (point.is_a?(Hash) ? point.dup : point)
+          break if samples.length >= limit
+        end
+        samples
+      rescue StandardError
+        []
+      end
+
+      def write_preview_sample(points)
+        return if points.nil? || points.empty?
+
+        store = pipeline&.chunk_store
+        manifest = store&.manifest
+        cache_path = store&.cache_path
+        return unless manifest && cache_path
+
+        require 'fileutils'
+        require 'json'
+
+        FileUtils.mkdir_p(cache_path)
+        filename = 'preview.json'
+        path = File.join(cache_path, filename)
+
+        serialized = Array(points).first(PREVIEW_SAMPLE_LIMIT).filter_map do |point|
+          serialize_preview_point(point)
+        end
+
+        File.binwrite(path, JSON.pretty_generate(serialized))
+        manifest.preview_file = filename if manifest.respond_to?(:preview_file=)
+        manifest.write! if manifest.respond_to?(:write!)
       rescue StandardError => e
-        handle_failure(e)
+        warn("Failed to write preview sample: #{e.message}")
+      end
+
+      def serialize_preview_point(point)
+        position = nil
+        color = nil
+        intensity = nil
+
+        if point.is_a?(Hash)
+          position = point[:position] || point['position']
+          color = point[:color] || point['color']
+          intensity = point[:intensity] || point['intensity']
+        elsif point.respond_to?(:position)
+          position = point.position
+          color = point.respond_to?(:color) ? point.color : nil
+          intensity = point.respond_to?(:intensity) ? point.intensity : nil
+        elsif point.respond_to?(:to_a)
+          position = point.to_a
+        end
+
+        coords = Array(position).first(3)
+        return unless coords.length == 3
+
+        data = { position: coords.map { |value| value.to_f } }
+
+        if color
+          rgb = Array(color).first(3).map do |value|
+            begin
+              Float(value)
+            rescue ArgumentError, TypeError
+              value.to_i
+            end
+          end
+          data[:color] = rgb if rgb.any?
+        end
+
+        if intensity
+          begin
+            data[:intensity] = Float(intensity)
+          rescue ArgumentError, TypeError
+            nil
+          end
+        end
+
+        data
+      rescue StandardError
+        nil
+      end
+
+      def flush_pending_view_invalidation
+        return unless @pending_view_invalidation
+
+        invalidate_active_view
+        @pending_view_invalidation = false
       end
 
       def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false, preview_ready: false, stage: nil, stage_progress: nil, preview_points: nil)
@@ -520,7 +800,7 @@ module PointCloudPlugin
 
       def finalize_stage_completion
         @stage_progress.keys.each { |key| @stage_progress[key] = 1.0 }
-        transition_state(:visualizing) unless @state == :visualizing || @state == :navigating
+        transition_state(:build) unless %i[build navigating].include?(@state)
       end
 
       def handle_cancellation(total_points, estimated_total, size_in_bytes)
@@ -532,6 +812,7 @@ module PointCloudPlugin
 
         queue.push do
           update_hud_progress(total_points, estimated_total, nil, elapsed: elapsed, bytes_processed: bytes_processed)
+          flush_pending_view_invalidation
           @on_complete&.call(self)
         end
       end
@@ -542,6 +823,7 @@ module PointCloudPlugin
         transition_state(:cancelled)
         queue.push do
           update_hud_failure(error)
+          flush_pending_view_invalidation
           if defined?(UI) && UI.respond_to?(:messagebox)
             UI.messagebox("Point cloud import failed: #{error.message}")
           end

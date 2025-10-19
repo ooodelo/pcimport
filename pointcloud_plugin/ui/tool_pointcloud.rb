@@ -291,9 +291,10 @@ module PointCloudPlugin
 
         label = case new_state
                 when :initializing then 'Загрузка: инициализация'
-                when :reading then 'Загрузка: чтение'
-                when :preparing then 'Загрузка: подготовка данных'
-                when :visualizing then 'Загрузка: визуализация'
+                when :hash_check then 'Загрузка: проверка источника'
+                when :sampling then 'Загрузка: выборка точек'
+                when :cache_write then 'Загрузка: запись кэша'
+                when :build then 'Загрузка: построение'
                 when :navigating then 'Работа: навигация'
                 when :cancelled then 'Загрузка отменена'
                 else
