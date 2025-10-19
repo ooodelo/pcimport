@@ -67,9 +67,7 @@ module PointCloudPlugin
         end
 
         def samples(total_quota: nil)
-          return reservoirs.values.flat_map { |reservoir| reservoir.samples.dup } if total_quota.nil?
-
-          total_quota = total_quota.to_i
+          total_quota = total_quota.nil? ? default_size : total_quota.to_i
           return [] if total_quota <= 0 || reservoirs.empty?
 
           nodes = reservoirs.keys
