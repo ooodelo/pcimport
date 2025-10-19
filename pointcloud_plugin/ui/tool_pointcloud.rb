@@ -92,6 +92,7 @@ module PointCloudPlugin
         default_color = default_point_color
 
         begin
+          drain_manager_queue
           expire_memory_notice_if_needed
           update_fps
           overlay_points = draw_overlay(view)
@@ -535,6 +536,15 @@ module PointCloudPlugin
         elsif payload.is_a?(Hash) && payload[:stage_progress] && import_overlay.respond_to?(:update_stage_progress)
           import_overlay.update_stage_progress(payload[:stage_progress])
         end
+      end
+
+      def drain_manager_queue
+        queue = manager&.queue
+        return unless queue && queue.respond_to?(:drain)
+
+        queue.drain
+      rescue StandardError => e
+        Kernel.puts("[PointCloudPlugin:queue] #{e.class}: #{e.message}")
       end
 
       def extract_boolean(payload, key)
