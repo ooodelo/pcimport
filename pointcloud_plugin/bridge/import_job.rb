@@ -40,6 +40,9 @@ module PointCloudPlugin
         @cancelled = false
         @preview_activation_ratio = DEFAULT_PREVIEW_THRESHOLD
         @pending_view_invalidation = false
+        @pending_preview_activation = false
+        @suppress_view_updates = true
+        @geometry_ready_notified = false
       end
 
       def start(&block)
@@ -194,6 +197,7 @@ module PointCloudPlugin
             elapsed: elapsed,
             bytes_processed: size_in_bytes
           )
+          flush_pending_preview_activation
           flush_pending_view_invalidation
           @on_complete&.call(self)
         end
@@ -321,6 +325,7 @@ module PointCloudPlugin
             elapsed: elapsed,
             bytes_processed: size_in_bytes
           )
+          flush_pending_preview_activation
           flush_pending_view_invalidation
           @on_complete&.call(self)
         end
@@ -499,17 +504,40 @@ module PointCloudPlugin
         return if cloud_id.nil?
 
         samples = Array(raw_samples)
-        return if samples.empty?
-        return unless queue.respond_to?(:push_sync)
+        if samples.empty?
+          queue.push do
+            resume_view_updates
+            flush_pending_preview_activation
+            flush_pending_view_invalidation
+          end
+          return
+        end
 
-        queue.push_sync do
+        job = proc do
+          group = nil
           begin
             builder = PointCloudPlugin::UI::CPointsBuilder.new
-            builder.build(cloud_id: cloud_id, samples: samples)
+            group = builder.build(cloud_id: cloud_id, samples: samples)
             apply_preview_visibility_settings
           rescue StandardError => e
             warn("Failed to build preview construction points: #{e.message}")
+            raise
+          ensure
+            resume_view_updates
+            flush_pending_preview_activation
+            flush_pending_view_invalidation
+            notify_geometry_ready if group
           end
+          group
+        end
+
+        if queue.respond_to?(:push_blocking) && queue.respond_to?(:await)
+          promise = queue.push_blocking(&job)
+          queue.await(promise)
+        elsif queue.respond_to?(:push_sync)
+          queue.push_sync(&job)
+        else
+          job.call
         end
       rescue StandardError => e
         warn("Failed to dispatch preview construction points: #{e.message}")
@@ -583,9 +611,48 @@ module PointCloudPlugin
 
       def flush_pending_view_invalidation
         return unless @pending_view_invalidation
+        return if view_updates_suppressed?
 
         invalidate_active_view
         @pending_view_invalidation = false
+      end
+
+      def flush_pending_preview_activation
+        return unless @pending_preview_activation
+        return if view_updates_suppressed?
+
+        @pending_preview_activation = false
+        perform_preview_layer_activation
+      end
+
+      def view_updates_suppressed?
+        !!@suppress_view_updates
+      end
+
+      def resume_view_updates
+        previously = @suppress_view_updates
+        @suppress_view_updates = false
+        previously
+      end
+
+      def notify_geometry_ready
+        return if @geometry_ready_notified
+
+        @geometry_ready_notified = true
+        dispatch_geometry_ready
+      end
+
+      def dispatch_geometry_ready
+        tool = active_tool
+        return unless tool
+
+        if tool.respond_to?(:handle_preview_geometry_ready)
+          tool.handle_preview_geometry_ready(job: self)
+        elsif tool.respond_to?(:handle_import_geometry_ready)
+          tool.handle_import_geometry_ready(job: self)
+        end
+      rescue StandardError => e
+        warn("Failed to notify geometry readiness: #{e.message}")
       end
 
       def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false, preview_ready: false, stage: nil, stage_progress: nil, preview_points: nil)
@@ -866,6 +933,15 @@ module PointCloudPlugin
       end
 
       def activate_preview_layer
+        if view_updates_suppressed?
+          @pending_preview_activation = true
+          return
+        end
+
+        perform_preview_layer_activation
+      end
+
+      def perform_preview_layer_activation
         return unless defined?(PointCloudPlugin)
 
         tool = PointCloudPlugin.respond_to?(:tool) ? PointCloudPlugin.tool : nil
@@ -973,9 +1049,11 @@ module PointCloudPlugin
         pipeline.chunk_store.flush! if pipeline.respond_to?(:chunk_store)
         elapsed = elapsed_time
         bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
+        resume_view_updates
 
         queue.push do
           update_hud_progress(total_points, estimated_total, nil, elapsed: elapsed, bytes_processed: bytes_processed)
+          flush_pending_preview_activation
           flush_pending_view_invalidation
           @on_complete&.call(self)
         end
@@ -985,8 +1063,10 @@ module PointCloudPlugin
         warn("Import failed: #{error.class}: #{error.message}\n#{Array(error.backtrace).join("\n")}")
         @completion_status = :failed
         transition_state(:cancelled)
+        resume_view_updates
         queue.push do
           update_hud_failure(error)
+          flush_pending_preview_activation
           flush_pending_view_invalidation
           if defined?(UI) && UI.respond_to?(:messagebox)
             UI.messagebox("Point cloud import failed: #{error.message}")

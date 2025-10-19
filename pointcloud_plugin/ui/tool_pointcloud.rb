@@ -227,6 +227,15 @@ module PointCloudPlugin
         end
       end
 
+      def handle_preview_geometry_ready(job:)
+        return unless job && job == @active_import_job
+
+        unless @visualization_announced
+          hud.update(load_status: 'Первые точки готовы') if hud
+          @visualization_announced = true
+        end
+      end
+
       def handle_import_completion(job)
         return unless job && job == @active_import_job
 
