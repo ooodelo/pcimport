@@ -7,16 +7,18 @@ module PointCloudPlugin
       attr_reader :state
 
       STEP_LABELS = {
-        reading: 'Чтение файла',
-        preparing: 'Упаковка данных',
-        visualizing: 'Визуализация'
+        hash_check: 'Проверка источника',
+        sampling: 'Выборка точек',
+        cache_write: 'Запись кэша',
+        build: 'Построение модели'
       }.freeze
 
       STATE_TITLES = {
         initializing: 'Загрузка облака…',
-        reading: 'Загрузка облака…',
-        preparing: 'Загрузка облака…',
-        visualizing: 'Загрузка облака…',
+        hash_check: 'Загрузка облака…',
+        sampling: 'Загрузка облака…',
+        cache_write: 'Загрузка облака…',
+        build: 'Загрузка облака…',
         navigating: 'Работа: навигация',
         cancelled: 'Загрузка отменена'
       }.freeze
@@ -130,17 +132,19 @@ module PointCloudPlugin
 
       def default_stage_status
         {
-          reading: :pending,
-          preparing: :pending,
-          visualizing: :pending
+          hash_check: :pending,
+          sampling: :pending,
+          cache_write: :pending,
+          build: :pending
         }
       end
 
       def default_stage_progress
         {
-          reading: 0.0,
-          preparing: 0.0,
-          visualizing: 0.0
+          hash_check: 0.0,
+          sampling: 0.0,
+          cache_write: 0.0,
+          build: 0.0
         }
       end
 
@@ -149,16 +153,21 @@ module PointCloudPlugin
 
         case new_state
         when :initializing
-          @stage_status[:reading] = :active
-        when :reading
-          @stage_status[:reading] = :active
-        when :preparing
-          @stage_status[:reading] = :complete
-          @stage_status[:preparing] = :active
-        when :visualizing
-          @stage_status[:reading] = :complete
-          @stage_status[:preparing] = :complete
-          @stage_status[:visualizing] = :active
+          @stage_status[:hash_check] = :active
+        when :hash_check
+          @stage_status[:hash_check] = :active
+        when :sampling
+          @stage_status[:hash_check] = :complete
+          @stage_status[:sampling] = :active
+        when :cache_write
+          @stage_status[:hash_check] = :complete
+          @stage_status[:sampling] = :complete
+          @stage_status[:cache_write] = :active
+        when :build
+          @stage_status[:hash_check] = :complete
+          @stage_status[:sampling] = :complete
+          @stage_status[:cache_write] = :complete
+          @stage_status[:build] = :active
         when :navigating
           @stage_status.transform_values! { |_value| :complete }
         when :cancelled

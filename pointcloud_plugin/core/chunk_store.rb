@@ -10,7 +10,7 @@ module PointCloudPlugin
     class ChunkStore
       Entry = Struct.new(:key, :chunk, :bytes)
 
-      attr_reader :cache_path, :max_in_memory, :memory_limit_bytes
+      attr_reader :cache_path, :max_in_memory, :memory_limit_bytes, :manifest
 
       DEFAULT_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
@@ -108,7 +108,7 @@ module PointCloudPlugin
 
       private
 
-      attr_reader :serializer, :manifest
+      attr_reader :serializer
 
       def normalize_memory_limit(mb)
         return DEFAULT_MEMORY_LIMIT_BYTES if mb.nil?
