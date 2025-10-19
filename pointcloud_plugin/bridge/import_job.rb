@@ -35,8 +35,14 @@ module PointCloudPlugin
 
       def run
         total_points = 0
-        estimated_total = estimate_total_points
+        size_in_bytes = file_size_bytes
+        estimated_total = estimate_total_points(size_in_bytes)
         first_chunk_shown = false
+        @start_time = monotonic_time
+        @last_log_time = @start_time
+        @last_logged_percent = 0.0
+
+        log_start(size_in_bytes, estimated_total)
 
         reader.each_batch do |batch|
           total_points += batch.size
@@ -49,6 +55,10 @@ module PointCloudPlugin
           progress_percent = if estimated_total && estimated_total.positive?
                                [((total_points.to_f / estimated_total) * 100.0), 100.0].min
                              end
+
+          elapsed = elapsed_time
+          bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
+          log_progress(total_points, estimated_total, progress_percent, elapsed, bytes_processed)
 
           queue.push do
             notify_progress(
@@ -70,12 +80,27 @@ module PointCloudPlugin
               end
             end
 
-            update_hud_progress(total_points, estimated_total, progress_percent)
+            update_hud_progress(
+              total_points,
+              estimated_total,
+              progress_percent,
+              elapsed: elapsed,
+              bytes_processed: bytes_processed
+            )
           end
         end
 
+        elapsed = elapsed_time
+        log_completion(total_points, elapsed, size_in_bytes)
+
         queue.push do
-          update_hud_progress(total_points, estimated_total, 100.0)
+          update_hud_progress(
+            total_points,
+            estimated_total,
+            100.0,
+            elapsed: elapsed,
+            bytes_processed: size_in_bytes
+          )
           @on_complete&.call(self)
         end
       rescue StandardError => e
@@ -106,17 +131,15 @@ module PointCloudPlugin
         end
       end
 
-      def estimate_total_points
-        size_in_bytes = File.size?(path)
-        return unless size_in_bytes
+      def estimate_total_points(size_in_bytes = nil)
+        size = size_in_bytes || file_size_bytes
+        return unless size
 
         average_point_size = 32.0
-        [(size_in_bytes / average_point_size).ceil, 1].max
-      rescue Errno::ENOENT
-        nil
+        [(size / average_point_size).ceil, 1].max
       end
 
-      def update_hud_progress(total_points, estimated_total, progress_percent)
+      def update_hud_progress(total_points, estimated_total, progress_percent, elapsed: nil, bytes_processed: nil)
         return unless defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:tool)
 
         tool = PointCloudPlugin.tool
@@ -124,7 +147,12 @@ module PointCloudPlugin
         return unless hud
 
         status_text = build_status_text(total_points, estimated_total, progress_percent)
-        hud.update(load_status: status_text)
+        speed_text = build_speed_text(total_points, elapsed, bytes_processed)
+
+        metrics = { load_status: status_text }
+        metrics[:load_speed] = speed_text if speed_text
+
+        hud.update(metrics)
       end
 
       def update_hud_failure(error)
@@ -143,10 +171,25 @@ module PointCloudPlugin
         if estimated_total && progress_percent
           total_points_label = format_points(estimated_total)
           percent_label = format('%.0f%%', progress_percent)
-          "Loading: #{percent_label} (#{loaded_points} / #{total_points_label} points)"
+          bar = progress_bar(progress_percent)
+          "Loading: #{bar} #{percent_label} (#{loaded_points} / #{total_points_label} points)"
         else
           "Loading: #{loaded_points} points"
         end
+      end
+
+      def build_speed_text(total_points, elapsed, bytes_processed)
+        return unless elapsed && elapsed.positive?
+
+        points_per_second = total_points.to_f / elapsed
+        parts = [format('%s pts/s', format_points(points_per_second))]
+
+        if bytes_processed && bytes_processed.positive?
+          bytes_per_second = bytes_processed / elapsed
+          parts << format('%s/s', format_bytes(bytes_per_second))
+        end
+
+        "Speed: #{parts.join(' | ')}"
       end
 
       def format_points(value)
@@ -165,6 +208,130 @@ module PointCloudPlugin
         end
 
         number.round.to_s
+      end
+
+      def format_bytes(value)
+        number = value.to_f
+        units = %w[B KB MB GB TB]
+        index = 0
+
+        while number >= 1024.0 && index < units.length - 1
+          number /= 1024.0
+          index += 1
+        end
+
+        if number >= 10
+          format('%.0f %s', number, units[index])
+        else
+          format('%.1f %s', number, units[index])
+        end
+      end
+
+      def progress_bar(progress_percent, width = 20)
+        return ('-' * width) unless progress_percent
+
+        clamped = progress_percent.clamp(0.0, 100.0)
+        filled = ((clamped / 100.0) * width).round
+        "[#{'=' * filled}#{'.' * (width - filled)}]"
+      end
+
+      def monotonic_time
+        if Process.const_defined?(:CLOCK_MONOTONIC)
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        else
+          Process.clock_gettime(:monotonic)
+        end
+      rescue Errno::EINVAL
+        Time.now.to_f
+      end
+
+      def elapsed_time
+        return 0.0 unless @start_time
+
+        monotonic_time - @start_time
+      end
+
+      def processed_bytes(total_points, estimated_total, size_in_bytes)
+        return unless total_points.positive? && estimated_total && estimated_total.positive? && size_in_bytes
+
+        ratio = [total_points.to_f / estimated_total, 1.0].min
+        size_in_bytes * ratio
+      end
+
+      def file_size_bytes
+        File.size?(path)
+      rescue Errno::ENOENT
+        nil
+      end
+
+      def log_start(size_in_bytes, estimated_total)
+        return unless defined?(PointCloudPlugin)
+
+        info = []
+        info << "file=#{File.basename(path)}"
+        info << "size=#{format_bytes(size_in_bytes)}" if size_in_bytes
+        info << "est_points=#{format_points(estimated_total)}" if estimated_total
+        PointCloudPlugin.log("Import started (#{info.join(', ')})")
+      end
+
+      def log_progress(total_points, estimated_total, progress_percent, elapsed, bytes_processed)
+        return unless defined?(PointCloudPlugin) && progress_percent
+
+        now = monotonic_time
+        should_log = (progress_percent - @last_logged_percent >= 5.0) || (now - @last_log_time >= 2.0) || progress_percent >= 99.0
+        return unless should_log
+
+        @last_logged_percent = progress_percent
+        @last_log_time = now
+
+        points_label = "#{format_points(total_points)} pts"
+        percent_label = format('%.0f%%', progress_percent)
+        speed_label = build_speed_text(total_points, elapsed, bytes_processed)
+        eta_label = eta_text(total_points, estimated_total, elapsed)
+
+        message_parts = [percent_label, points_label]
+        message_parts << speed_label if speed_label
+        message_parts << eta_label if eta_label
+        PointCloudPlugin.log("Import progress #{message_parts.compact.join(' | ')}")
+      end
+
+      def eta_text(total_points, estimated_total, elapsed)
+        return unless estimated_total && elapsed && elapsed.positive? && total_points.positive?
+
+        remaining_points = estimated_total - total_points
+        return if remaining_points <= 0
+
+        points_per_second = total_points.to_f / elapsed
+        return if points_per_second <= 0
+
+        eta_seconds = remaining_points / points_per_second
+        "ETA #{format_duration(eta_seconds)}"
+      end
+
+      def format_duration(seconds)
+        total_seconds = seconds.round
+        return '<1s' if total_seconds <= 0
+
+        mins, secs = total_seconds.divmod(60)
+        hours, mins = mins.divmod(60)
+
+        if hours.positive?
+          format('%dh %02dm', hours, mins)
+        elsif mins.positive?
+          format('%dm %02ds', mins, secs)
+        else
+          format('%ds', secs)
+        end
+      end
+
+      def log_completion(total_points, elapsed, size_in_bytes)
+        return unless defined?(PointCloudPlugin)
+
+        speed_text = build_speed_text(total_points, elapsed, size_in_bytes)
+        duration = format_duration(elapsed)
+        message_parts = ["completed in #{duration}", "total=#{format_points(total_points)} pts"]
+        message_parts << speed_text if speed_text
+        PointCloudPlugin.log("Import #{message_parts.compact.join(' | ')}")
       end
 
       def pack(batch)
