@@ -8,6 +8,8 @@ require_relative '../core/spatial/knn'
 require_relative '../core/spatial/frustum'
 require_relative 'hud'
 require_relative 'dialog_settings'
+require_relative 'visibility' rescue nil
+require_relative 'preview_layer' rescue nil
 
 module PointCloudPlugin
   module UI
@@ -37,42 +39,48 @@ module PointCloudPlugin
       end
 
       def draw(view)
-        update_fps
-        gather_chunks(view)
-        points_by_color = Hash.new { |hash, key| hash[key] = [] }
-        color_lookup = {}
+        begin
+          update_fps
+          gather_chunks(view)
+          points_by_color = Hash.new { |hash, key| hash[key] = [] }
+          color_lookup = {}
 
-        @chunk_usage.each do |key|
-          entry = @active_chunks[key]
-          next unless entry
+          @chunk_usage.each do |key|
+            entry = @active_chunks[key]
+            next unless entry
 
-          chunk = entry[:chunk]
-          chunk.size.times do |index|
-            point = chunk.point_at(index)
-            key, color_value = color_bucket_for(point)
-            color_lookup[key] ||= color_value
-            points_by_color[key] << point[:position]
-          end
-        end
-
-        if view.respond_to?(:draw_points)
-          default_color = if defined?(Sketchup::Color)
-                            Sketchup::Color.new(0, 0, 0)
-                          else
-                            'black'
-                          end
-
-          points_by_color.each do |color_key, positions|
-            color = color_for(color_key, color_lookup[color_key], default_color)
-
-            positions.each_slice(max_points_per_batch) do |batch|
-              sketchup_points = convert_positions_to_points(batch)
-              next if sketchup_points.empty?
-
-              view.draw_points(sketchup_points, @settings[:point_size], 1, color)
+            chunk = entry[:chunk]
+            chunk.size.times do |index|
+              point = chunk.point_at(index)
+              key, color_value = color_bucket_for(point)
+              color_lookup[key] ||= color_value
+              points_by_color[key] << point[:position]
             end
           end
+
+          if view.respond_to?(:draw_points)
+            default_color = if defined?(Sketchup::Color)
+                              Sketchup::Color.new(0, 0, 0)
+                            else
+                              'black'
+                            end
+
+            points_by_color.each do |color_key, positions|
+              color = color_for(color_key, color_lookup[color_key], default_color)
+
+              positions.each_slice(max_points_per_batch) do |batch|
+                sketchup_points = convert_positions_to_points(batch)
+                next if sketchup_points.empty?
+
+                view.draw_points(sketchup_points, safe_point_size, 1, color)
+              end
+            end
+          end
+        rescue => e
+          Kernel.puts("[PointCloudPlugin:draw] #{e.class}: #{e.message}\n  #{e.backtrace&.first}")
+        ensure
           draw_snap(view)
+          PointCloud::UI::PreviewLayer.draw(view, self) if defined?(PointCloud::UI::PreviewLayer)
           hud.draw(view)
         end
       end
@@ -152,13 +160,20 @@ module PointCloudPlugin
 
       def color_for(key, rgb_values, default_color)
         return default_color if key == :default || rgb_values.nil?
-
         r, g, b = rgb_values
-        if defined?(Sketchup::Color)
-          Sketchup::Color.new(r, g, b)
-        else
-          format('#%02X%02X%02X', r, g, b)
-        end
+        Sketchup::Color.new(r.to_i.clamp(0, 255), g.to_i.clamp(0, 255), b.to_i.clamp(0, 255))
+      end
+
+      def safe_point_size
+        raw = @settings && @settings[:point_size]
+        v = case raw
+            when Integer then raw
+            when Float then raw.to_i
+            else raw.to_s.to_i
+            end
+        v = 1 if v < 1
+        v = 9 if v > 9
+        v
       end
 
       def gather_chunks(view)
@@ -350,7 +365,7 @@ module PointCloudPlugin
                   '#FF0000'
                 end
 
-        view.draw_points(snap_points, @settings[:point_size] * 2, 2, color)
+        view.draw_points(snap_points, safe_point_size * 2, 2, color)
       end
 
       def max_points_per_batch
