@@ -126,23 +126,10 @@ module PointCloudPlugin
         HTML
         dialog.set_html(html)
         dialog.add_action_callback('apply') do |_context, payload|
-          data = JSON.parse(payload)
-          if data.key?('budget')
-            @settings[:budget] = data['budget'].to_i.clamp(100_000, 10_000_000)
-          end
-          if data.key?('point_size')
-            @settings[:point_size] = data['point_size'].to_i.clamp(1, 9)
-          end
-          if data.key?('snap_radius')
-            @settings[:snap_radius] = data['snap_radius'].to_f.clamp(0.1, 1000.0)
-          end
-          if data.key?('memory_limit')
-            @settings[:memory_limit] = data['memory_limit'].to_i.clamp(128, 65_536)
-          end
-          if data.key?('monochrome')
-            @settings[:monochrome] = !!data['monochrome']
-          end
-          @on_change&.call(@settings)
+          raw = safe_parse_json(payload)
+          normalized = normalize_runtime_settings(raw)
+          @settings.merge!(normalized)
+          notify_runtime_change
         end
         dialog
       end
@@ -281,6 +268,93 @@ module PointCloudPlugin
       public :show_import_dialog, :import_options
 
       private
+
+      def notify_runtime_change
+        snapshot = @settings.dup
+        @on_change&.call(snapshot)
+
+        return unless defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:apply_runtime_settings)
+
+        PointCloudPlugin.apply_runtime_settings(snapshot)
+      rescue StandardError
+        # Ignore errors to keep dialog responsive.
+      end
+
+      def safe_parse_json(payload)
+        return {} if payload.nil? || payload.to_s.empty?
+
+        JSON.parse(payload)
+      rescue JSON::ParserError
+        {}
+      end
+
+      def normalize_runtime_settings(raw)
+        data = raw.is_a?(Hash) ? raw : {}
+        data = data.transform_keys { |key| key.to_s.downcase.to_sym }
+
+        {
+          budget: clamp_integer(fetch_numeric(data, :budget, settings[:budget]), 100_000, 10_000_000),
+          point_size: clamp_integer(fetch_numeric(data, :point_size, settings[:point_size]), 1, 9),
+          snap_radius: clamp_float(fetch_numeric(data, :snap_radius, settings[:snap_radius]), 0.1, 1000.0),
+          memory_limit: clamp_integer(fetch_numeric(data, :memory_limit, settings[:memory_limit]), 128, 65_536),
+          monochrome: fetch_boolean(data, :monochrome, settings[:monochrome])
+        }
+      end
+
+      def fetch_numeric(data, key, default)
+        value = extract_scalar(data[key])
+        return default if value.nil?
+
+        if value.is_a?(Numeric)
+          value
+        elsif value.respond_to?(:to_s)
+          text = value.to_s.strip
+          return default if text.empty?
+
+          begin
+            Float(text)
+          rescue ArgumentError
+            default
+          end
+        else
+          default
+        end
+      end
+
+      def fetch_boolean(data, key, default)
+        value = extract_scalar(data[key])
+        case value
+        when true, 'true', '1', 1 then true
+        when false, 'false', '0', 0 then false
+        else
+          default
+        end
+      end
+
+      def clamp_integer(value, min, max)
+        coerced = value.to_i
+        coerced = min if coerced < min
+        coerced = max if coerced > max
+        coerced
+      end
+
+      def clamp_float(value, min, max)
+        coerced = value.to_f
+        coerced = min if coerced < min
+        coerced = max if coerced > max
+        coerced
+      end
+
+      def extract_scalar(value)
+        case value
+        when Array
+          extract_scalar(value.first)
+        when Hash
+          value[:value] || value['value']
+        else
+          value
+        end
+      end
     end
   end
 end
