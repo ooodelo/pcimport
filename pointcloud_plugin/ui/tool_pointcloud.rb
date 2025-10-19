@@ -57,6 +57,13 @@ module PointCloudPlugin
         @camera_focused = false
         @memory_notice_expires_at = nil
         hook_settings
+        if @settings_dialog.respond_to?(:update_preview_controls)
+          @settings_dialog.update_preview_controls(
+            available: false,
+            show_points: @settings[:preview_show_points],
+            anchors_only: @settings[:preview_anchor_only]
+          )
+        end
       end
 
       def activate
@@ -178,6 +185,13 @@ module PointCloudPlugin
         update_import_state(:initializing)
         hud.update(load_status: "Загрузка: инициализация", memory_notice: nil)
         hud.update(points_on_screen: 0)
+        if settings_dialog.respond_to?(:update_preview_controls)
+          settings_dialog.update_preview_controls(
+            available: false,
+            show_points: @settings[:preview_show_points],
+            anchors_only: @settings[:preview_anchor_only]
+          )
+        end
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
           PointCloudPlugin.invalidate_active_view
         end

@@ -47,6 +47,7 @@ require_relative 'core/lod/pipeline'
 require_relative 'bridge/main_thread_queue'
 require_relative 'bridge/import_job'
 require_relative 'bridge/point_cloud_manager'
+require_relative 'ui/cpoints_builder'
 require_relative 'ui/tool_pointcloud'
 require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
@@ -318,7 +319,44 @@ module PointCloudPlugin
       end
     end
 
+    if symbolized.key?(:preview_show_points) || symbolized.key?(:preview_anchor_only)
+      show_points = !!symbolized[:preview_show_points]
+      anchor_only = !!symbolized[:preview_anchor_only]
+      update_preview_visibility(show_points: show_points, anchor_only: anchor_only)
+    end
+
     invalidate_active_view
+  end
+
+  def update_preview_visibility(show_points:, anchor_only:)
+    return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+    model = Sketchup.active_model
+    return unless model
+
+    layers = model.respond_to?(:layers) ? model.layers : nil
+    return unless layers
+
+    points_visible = !!show_points
+    anchors_only = points_visible && !!anchor_only
+
+    preview_tag = fetch_preview_tag(layers, UI::CPointsBuilder::TAG_PARENT)
+    all_tag = fetch_preview_tag(layers, UI::CPointsBuilder::TAG_ALL)
+    anchor_tag = fetch_preview_tag(layers, UI::CPointsBuilder::TAG_ANCHORS)
+
+    if preview_tag && preview_tag.respond_to?(:visible=)
+      preview_tag.visible = points_visible
+    end
+
+    if all_tag && all_tag.respond_to?(:visible=)
+      all_tag.visible = points_visible && !anchors_only
+    end
+
+    if anchor_tag && anchor_tag.respond_to?(:visible=)
+      anchor_tag.visible = points_visible
+    end
+  rescue StandardError => e
+    log("Failed to update preview visibility: #{e.message}")
   end
 
   def invalidate_active_view
@@ -355,6 +393,28 @@ module PointCloudPlugin
   rescue NoMethodError
     false
   end
+
+  def fetch_preview_tag(layers, name)
+    return unless layers
+
+    tag = begin
+      layers[name]
+    rescue StandardError
+      nil
+    end
+
+    return tag if tag
+
+    if layers.respond_to?(:each)
+      layers.each do |candidate|
+        return candidate if candidate.respond_to?(:name) && candidate.name == name
+      end
+    end
+
+    nil
+  end
+
+  private :fetch_preview_tag
 
 end
 
