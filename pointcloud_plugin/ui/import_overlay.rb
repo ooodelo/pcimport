@@ -73,7 +73,8 @@ module PointCloudPlugin
 
         ensure_geometry_dependencies
 
-        options = { size: DEFAULT_FONT_SIZE, align: 1 }
+        text_col = text_color
+        options = { size: DEFAULT_FONT_SIZE, align: 1, color: text_col }
         title_options = options.merge(size: TITLE_FONT_SIZE)
 
         lines = overlay_lines
@@ -197,6 +198,9 @@ module PointCloudPlugin
 
       def draw_panel_background(view, origin, width, height)
         return unless view.respond_to?(:draw2d)
+        return unless defined?(GL_QUADS)
+
+        view.drawing_color = [240, 240, 240, 230] if view.respond_to?(:drawing_color=)
 
         top_left = build_point(origin.x, origin.y)
         top_right = build_point(origin.x + width, origin.y)
@@ -209,8 +213,10 @@ module PointCloudPlugin
           bottom_right,
           bottom_left
         ])
-      rescue NameError
-        # GL constants may be undefined outside SketchUp; ignore background in that case.
+      rescue NameError => e
+        PointCloudPlugin.log("GL constants unavailable: #{e.message}") if defined?(PointCloudPlugin)
+      rescue StandardError => e
+        PointCloudPlugin.log("Failed to draw panel background: #{e.message}") if defined?(PointCloudPlugin)
       end
 
       def button_width(view, options)
@@ -265,6 +271,14 @@ module PointCloudPlugin
           Geom::Point3d.new(x, y, z)
         else
           Struct.new(:x, :y, :z).new(x, y, z)
+        end
+      end
+
+      def text_color
+        if defined?(Sketchup::Color)
+          Sketchup::Color.new(0, 0, 0)
+        else
+          [0, 0, 0]
         end
       end
     end
