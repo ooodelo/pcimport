@@ -10,7 +10,8 @@ module PointCloudPlugin
         budget: 2_000_000,
         point_size: 2,
         snap_radius: 5.0,
-        memory_limit: 512
+        memory_limit: 512,
+        monochrome: false
       }.freeze
 
       IMPORT_UNITS = [
@@ -45,6 +46,8 @@ module PointCloudPlugin
         dialog = ::UI::HtmlDialog.new(dialog_title: 'Point Cloud Settings', width: 360, height: 360)
         budget_millions = (settings[:budget].to_f / 1_000_000.0)
         budget_display = format('%.1f', budget_millions)
+        monochrome_checked = settings[:monochrome] ? 'checked' : ''
+
         html = <<~HTML
           <html>
             <head>
@@ -70,6 +73,7 @@ module PointCloudPlugin
                 <label>Point size: <input id="point_size" type="number" min="1" value="#{settings[:point_size]}"></label>
                 <label>Snap radius: <input id="snap_radius" type="number" step="0.1" value="#{settings[:snap_radius]}"></label>
                 <label>Memory limit (MB): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label>
+                <label><input id="monochrome" type="checkbox" #{monochrome_checked}> Monochrome</label>
               </div>
               <div class="buttons">
                 <button id="apply_button" type="button">Apply</button>
@@ -104,7 +108,8 @@ module PointCloudPlugin
                       budget: Math.round(parseFloat(slider.value) * 1000000),
                       point_size: parseInt(document.getElementById('point_size').value, 10),
                       snap_radius: parseFloat(document.getElementById('snap_radius').value),
-                      memory_limit: parseInt(document.getElementById('memory_limit').value, 10)
+                      memory_limit: parseInt(document.getElementById('memory_limit').value, 10),
+                      monochrome: document.getElementById('monochrome').checked
                     };
                     if (window.sketchup && typeof window.sketchup.apply === 'function') {
                       window.sketchup.apply(JSON.stringify(payload));
@@ -122,10 +127,21 @@ module PointCloudPlugin
         dialog.set_html(html)
         dialog.add_action_callback('apply') do |_context, payload|
           data = JSON.parse(payload)
-          @settings[:budget] = data['budget'].to_i if data.key?('budget')
-          @settings[:point_size] = data['point_size'].to_i if data.key?('point_size')
-          @settings[:snap_radius] = data['snap_radius'].to_f if data.key?('snap_radius')
-          @settings[:memory_limit] = data['memory_limit'].to_i if data.key?('memory_limit')
+          if data.key?('budget')
+            @settings[:budget] = data['budget'].to_i.clamp(100_000, 10_000_000)
+          end
+          if data.key?('point_size')
+            @settings[:point_size] = data['point_size'].to_i.clamp(1, 9)
+          end
+          if data.key?('snap_radius')
+            @settings[:snap_radius] = data['snap_radius'].to_f.clamp(0.1, 1000.0)
+          end
+          if data.key?('memory_limit')
+            @settings[:memory_limit] = data['memory_limit'].to_i.clamp(128, 65_536)
+          end
+          if data.key?('monochrome')
+            @settings[:monochrome] = !!data['monochrome']
+          end
           @on_change&.call(@settings)
         end
         dialog
