@@ -6,7 +6,7 @@ module PointCloudPlugin
   module Core
     # Stores chunks in memory and persists them to disk using an LRU policy.
     class ChunkStore
-      Entry = Struct.new(:key, :chunk)
+      Entry = Struct.new(:key, :chunk, :bytes)
 
       attr_reader :cache_path, :max_in_memory
 
@@ -23,26 +23,29 @@ module PointCloudPlugin
 
       def store(key, chunk)
         previous = @entries[key]
-        @bytes_in_ram -= previous.byte_size if previous
-        @entries[key] = chunk
-        @bytes_in_ram += chunk.byte_size
+        @bytes_in_ram -= previous.bytes if previous
+
+        entry = Entry.new(key, chunk, chunk.memory_bytes)
+        @entries[key] = entry
+        @bytes_in_ram += entry.bytes
         touch(key)
         evict_until_limit
         persist_to_disk(key, chunk)
       end
 
       def fetch(key)
-        if @entries.key?(key)
+        if (entry = @entries[key])
           touch(key)
-          return @entries[key]
+          return entry.chunk
         end
 
         path = chunk_path(key)
         return unless File.exist?(path)
 
         chunk = Marshal.load(File.binread(path))
-        @entries[key] = chunk
-        @bytes_in_ram += chunk.byte_size
+        entry = Entry.new(key, chunk, chunk.memory_bytes)
+        @entries[key] = entry
+        @bytes_in_ram += entry.bytes
         touch(key)
         evict_until_limit
         chunk
@@ -56,13 +59,14 @@ module PointCloudPlugin
         return enum_for(:each_in_memory) unless block_given?
 
         @lru.each do |key|
-          yield key, @entries[key]
+          entry = @entries[key]
+          yield key, entry.chunk if entry
         end
       end
 
       def flush!
-        @entries.each do |key, chunk|
-          persist_to_disk(key, chunk)
+        @entries.each do |key, entry|
+          persist_to_disk(key, entry.chunk)
           notify_removed(key)
         end
         @entries.clear
@@ -71,8 +75,8 @@ module PointCloudPlugin
       end
 
       def release(key)
-        chunk = @entries.delete(key)
-        @bytes_in_ram -= chunk.byte_size if chunk
+        entry = @entries.delete(key)
+        @bytes_in_ram -= entry.bytes if entry
         @lru.delete(key)
         notify_removed(key)
       end
@@ -106,8 +110,10 @@ module PointCloudPlugin
       def evict_until_limit
         while @bytes_in_ram > @memory_limit_bytes && @lru.any?
           key = @lru.pop
-          chunk = @entries.delete(key)
-          @bytes_in_ram -= chunk.byte_size if chunk
+          entry = @entries.delete(key)
+          next unless entry
+
+          @bytes_in_ram -= entry.bytes
           notify_removed(key)
         end
       end
