@@ -84,14 +84,16 @@ module PointCloudPlugin
           @visible_nodes = [Node.new(refs)]
         end
 
-        def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil, visible_chunk_keys: nil, **_ignored)
+        def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil, visible_chunk_keys: nil, visible_nodes: nil, **_ignored)
           return @chunks if visible_chunk_keys.nil? || visible_chunk_keys.empty?
 
           keys = visible_chunk_keys.to_set
           @chunks.select { |key, _| keys.include?(key) }
         end
 
-        def visible_nodes_for(_frustum)
+        def visible_nodes_for(_frustum = nil, visible_chunk_keys: nil)
+          return [] if visible_chunk_keys&.empty?
+
           @visible_nodes
         end
 

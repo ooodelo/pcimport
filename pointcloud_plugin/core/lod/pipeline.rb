@@ -44,7 +44,8 @@ module PointCloudPlugin
           @budget = frame_budget
           budget = frame_budget
           unlimited_budget = budget.nil? || budget <= 0
-          visible_nodes ||= determine_visible_nodes(frustum)
+          visible_nodes ||= determine_visible_nodes_from_keys(visible_chunk_keys)
+          visible_nodes = determine_visible_nodes(frustum) if visible_nodes.nil?
           visible_nodes = filter_nodes_by_visible_keys(visible_nodes, visible_chunk_keys)
           return [] if visible_nodes.empty?
 
@@ -58,11 +59,23 @@ module PointCloudPlugin
           build_chunk_list(requests)
         end
 
-        def visible_nodes_for(frustum = nil)
+        def visible_nodes_for(frustum = nil, visible_chunk_keys: nil)
+          nodes = determine_visible_nodes_from_keys(visible_chunk_keys)
+          return nodes unless nodes.nil?
+
           determine_visible_nodes(frustum)
         end
 
         private
+
+        def determine_visible_nodes_from_keys(visible_chunk_keys)
+          return nil if visible_chunk_keys.nil?
+
+          keys = Array(visible_chunk_keys).compact
+          return [] if keys.empty?
+
+          keys.filter_map { |key| @chunk_nodes[key] }.uniq
+        end
 
         def filter_nodes_by_visible_keys(nodes, visible_keys)
           return Array(nodes).compact if visible_keys.nil?

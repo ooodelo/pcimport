@@ -269,12 +269,14 @@ module PointCloudPlugin
         budget = @settings[:budget].to_i
         points_accumulated = 0
 
-        visible_entries_by_cloud = manager.each_cloud.each_with_object({}) do |cloud, hash|
-          hash[cloud.id] = visible_chunk_entries_for(cloud, frustum, view)
+        visible_data_by_cloud = manager.each_cloud.each_with_object({}) do |cloud, hash|
+          hash[cloud.id] = visible_chunk_data_for(cloud, frustum, view)
         end
 
         manager.each_cloud do |cloud|
-          visible_entries = Array(visible_entries_by_cloud[cloud.id]).compact
+          visible_data = visible_data_by_cloud[cloud.id] || {}
+          visible_entries = Array(visible_data[:entries]).compact
+          visible_nodes = Array(visible_data[:nodes]).compact
           visible_chunk_keys = visible_entries.map { |entry| entry[:key] }.compact
 
           cloud.prefetcher.prefetch_for_view(
@@ -286,7 +288,8 @@ module PointCloudPlugin
             frame_budget: @settings[:budget],
             frustum: frustum,
             camera_position: camera_position,
-            visible_chunk_keys: visible_chunk_keys
+            visible_chunk_keys: visible_chunk_keys,
+            visible_nodes: visible_nodes
           ).each do |key, chunk|
             next unless chunk
 
@@ -394,14 +397,16 @@ module PointCloudPlugin
         visible_bounds?(bounds, frustum, view)
       end
 
-      def visible_chunk_entries_for(cloud, frustum, view)
+      def visible_chunk_data_for(cloud, frustum, view)
         nodes = cloud.pipeline.visible_nodes_for(frustum)
-        return [] unless nodes
+        return { entries: [], nodes: [] } unless nodes
+
+        visible_nodes = []
 
         entries = Array(nodes).flat_map do |node|
           next [] unless node.respond_to?(:chunk_refs)
 
-          Array(node.chunk_refs).filter_map do |ref|
+          chunk_entries = Array(node.chunk_refs).filter_map do |ref|
             key = ref[:key] || ref['key']
             next unless key
 
@@ -411,11 +416,17 @@ module PointCloudPlugin
 
             { key: key, bounds: bounds }
           end
+
+          visible_nodes << node if chunk_entries.any?
+          chunk_entries
         end
 
-        entries.uniq { |entry| entry[:key] }
+        {
+          entries: entries.uniq { |entry| entry[:key] },
+          nodes: visible_nodes.uniq
+        }
       rescue StandardError
-        []
+        { entries: [], nodes: [] }
       end
 
       def visible_bounds?(bounds, frustum, view)
