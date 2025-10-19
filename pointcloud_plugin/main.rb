@@ -49,6 +49,7 @@ require_relative 'ui/tool_pointcloud'
 require_relative 'ui/hud'
 require_relative 'ui/dialog_settings'
 require_relative 'ui/import_overlay'
+require_relative 'ui/entry_points'
 
 module PointCloudPlugin
   EXTENSION_ID ||= 'com.example.pointcloud'
@@ -65,33 +66,69 @@ module PointCloudPlugin
     @tool ||= UI::ToolPointCloud.new(manager)
   end
 
+  MENU_PARENT_LABELS = ['Extensions', 'Plugins'].freeze
+  MENU_TITLE = 'Point Cloud Importer'
+  IMPORT_COMMAND_TITLE = 'Import Point Cloud...'
+  SETTINGS_COMMAND_TITLE = 'Point Cloud Settings'
+
   def setup_menu
-    return unless defined?(::UI)
+    unless defined?(::UI) && ::UI.respond_to?(:menu)
+      log('UI.menu is unavailable; skipping menu setup')
+      return
+    end
+
     return if @menu_created
 
-    extensions_menu = ::UI.menu('Extensions')
-    submenu = extensions_menu.add_submenu('Point Cloud Importer')
-    submenu.add_item('Import Point Cloud...') { start_import }
-    submenu.add_item('Point Cloud Settings') { tool.settings_dialog.show }
+    MENU_PARENT_LABELS.each do |parent_label|
+      parent_menu = safe_menu(parent_label)
+      next unless parent_menu
+
+      submenu = parent_menu.add_submenu(MENU_TITLE)
+      submenu.add_item(IMPORT_COMMAND_TITLE) { start_import }
+      submenu.add_item(SETTINGS_COMMAND_TITLE) { tool.settings_dialog.show }
+    end
+
     @menu_created = true
     log('Menu items registered')
+  rescue StandardError => e
+    @menu_created = false
+    log("Failed to set up menu: #{e.class}: #{e.message}")
+    log(e.backtrace.join("\n")) if e.backtrace
+    raise
   end
 
   def setup_toolbar
-    return unless defined?(::UI)
+    unless defined?(::UI) && ::UI.const_defined?(:Toolbar)
+      log('UI::Toolbar is unavailable; skipping toolbar setup')
+      return
+    end
+
     return if @toolbar&.valid?
 
-    command = ::UI::Command.new('Import Point Cloud...') do
+    command = ::UI::Command.new(IMPORT_COMMAND_TITLE) do
       start_import
     end
     command.tooltip = 'Import a point cloud file'
     command.status_bar_text = 'Open a point cloud file for viewing'
 
-    toolbar = ::UI::Toolbar.new('Point Cloud Importer')
+    toolbar = ::UI::Toolbar.new(MENU_TITLE)
     toolbar.add_item(command)
     toolbar.show
     @toolbar = toolbar
+    @import_command = command
     log('Toolbar registered')
+  rescue StandardError => e
+    @toolbar = nil
+    log("Failed to set up toolbar: #{e.class}: #{e.message}")
+    log(e.backtrace.join("\n")) if e.backtrace
+    raise
+  end
+
+  def safe_menu(label)
+    ::UI.menu(label)
+  rescue StandardError => e
+    log("Failed to access '#{label}' menu: #{e.class}: #{e.message}")
+    nil
   end
 
   def start_import
@@ -276,8 +313,5 @@ module PointCloudPlugin
 
 end
 
-if defined?(::UI)
-  PointCloudPlugin.setup_menu
-  PointCloudPlugin.setup_toolbar
-end
+PointCloudPlugin::UI::EntryPoints.setup if defined?(PointCloudPlugin::UI::EntryPoints)
 PointCloudPlugin.log('Runtime load complete') if defined?(PointCloudPlugin)
