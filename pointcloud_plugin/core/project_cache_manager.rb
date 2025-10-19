@@ -2,6 +2,8 @@
 
 require 'fileutils'
 require 'securerandom'
+require 'tmpdir'
+require 'time'
 
 require_relative 'manifest'
 
@@ -91,14 +93,17 @@ module PointCloudPlugin
       # Registers bookkeeping data for the specified +cloud_id+.
       def register_cloud(id:, name:, source_path:, cache_path:, manifest: nil)
         normalized_source = normalize_path(source_path)
+        manifest_path = if manifest&.respond_to?(:path)
+                          manifest.path
+                        end
         data = {
           'id' => id.to_s,
           'name' => name,
           'source_path' => normalized_source,
           'cache_path' => cache_path,
           'project_path' => project_path,
-          'manifest_path' => manifest&.path,
-          'updated_at' => Time.now.utc.to_i
+          'manifest_path' => manifest_path,
+          'updated_at' => Time.now.utc.iso8601
         }
 
         @clouds[id.to_s] = data
