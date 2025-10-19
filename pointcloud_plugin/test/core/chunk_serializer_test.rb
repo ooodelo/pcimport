@@ -58,6 +58,36 @@ module PointCloudPlugin
         assert_raises(ChunkSerializer::CorruptedData) { @serializer.read(path) }
       end
 
+      def test_rejects_header_with_invalid_payload_length
+        chunk = build_chunk(point_count: 5, with_rgb: true)
+        path = File.join(@tmpdir, 'invalid-length.pccb')
+
+        @serializer.write(path, chunk)
+
+        File.open(path, 'rb+') do |io|
+          header = io.read(ChunkSerializer::HEADER_SIZE)
+          magic, version, header_size, count, payload_length, flags, *floats, crc =
+            header.unpack(ChunkSerializer::HEADER_FORMAT)
+
+          next_length = [payload_length - 1, 0].max
+          io.rewind
+          io.write([magic, version, header_size, count, next_length, flags, *floats, crc].pack(ChunkSerializer::HEADER_FORMAT))
+        end
+
+        assert_raises(ChunkSerializer::InvalidHeader) { @serializer.read(path) }
+      end
+
+      def test_quantization_bits_are_clamped_to_byte_range
+        chunk = build_chunk(point_count: 2)
+        chunk.metadata[:quantization_bits] = 1_024
+        path = File.join(@tmpdir, 'clamp-bits.pccb')
+
+        @serializer.write(path, chunk)
+        loaded = @serializer.read(path)
+
+        assert_equal 255, loaded.metadata[:quantization_bits]
+      end
+
       private
 
       def build_chunk(point_count:, with_rgb: false, with_intensity: false)
