@@ -329,21 +329,19 @@ module PointCloudPlugin
       end
 
       def current_frustum(view)
-        epsilon = Core::Spatial::Frustum::DEFAULT_EPSILON
-        return Core::Spatial::Frustum.new([], epsilon: epsilon) unless view
+        return unless view
 
+        epsilon = Core::Spatial::Frustum::DEFAULT_EPSILON
         camera = view.respond_to?(:camera) ? view.camera : nil
 
         modelview = extract_matrix(camera, :modelview_matrix) || extract_matrix(view, :modelview_matrix, :modelview)
         projection = extract_matrix(camera, :projection_matrix) || extract_matrix(view, :projection_matrix, :projection)
 
-        if modelview && projection
-          Core::Spatial::Frustum.from_view_matrices(modelview, projection, epsilon: epsilon)
-        else
-          Core::Spatial::Frustum.new([], epsilon: epsilon)
-        end
+        return unless modelview && projection
+
+        Core::Spatial::Frustum.from_view_matrices(modelview, projection, epsilon: epsilon)
       rescue ArgumentError
-        Core::Spatial::Frustum.new([], epsilon: epsilon)
+        nil
       end
 
       def current_camera_position(view)
