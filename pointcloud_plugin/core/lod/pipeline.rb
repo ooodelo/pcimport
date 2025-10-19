@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'set'
+
 require_relative '../chunk_store'
 require_relative '../chunk'
 require_relative 'reservoir'
@@ -32,24 +34,46 @@ module PointCloudPlugin
           clear_lod_cache_for(key)
         end
 
-        def next_chunks(frame_budget: @budget, frustum: nil, camera_position: nil)
+        def next_chunks(
+          frame_budget: @budget,
+          frustum: nil,
+          camera_position: nil,
+          visible_chunk_keys: nil,
+          visible_nodes: nil
+        )
           @budget = frame_budget
           budget = frame_budget
           unlimited_budget = budget.nil? || budget <= 0
-          visible_nodes = determine_visible_nodes(frustum)
+          visible_nodes ||= determine_visible_nodes(frustum)
+          visible_nodes = filter_nodes_by_visible_keys(visible_nodes, visible_chunk_keys)
           return [] if visible_nodes.empty?
 
           if unlimited_budget
-            keys = ordered_keys_for_nodes(visible_nodes)
+            keys = ordered_keys_for_nodes(visible_nodes, visible_chunk_keys)
             return keys.map { |key| [key, chunk_store.fetch(key)] }
           end
 
           quotas = @budget_distributor.distribute(visible_nodes, budget, camera_position)
-          requests = allocate_chunk_requests(visible_nodes, quotas)
+          requests = allocate_chunk_requests(visible_nodes, quotas, visible_chunk_keys)
           build_chunk_list(requests)
         end
 
+        def visible_nodes_for(frustum = nil)
+          determine_visible_nodes(frustum)
+        end
+
         private
+
+        def filter_nodes_by_visible_keys(nodes, visible_keys)
+          return Array(nodes).compact if visible_keys.nil?
+
+          visible_set = Array(visible_keys).compact.to_set
+          return [] if visible_set.empty?
+
+          Array(nodes).compact.select do |node|
+            node.chunk_refs.any? { |ref| visible_set.include?(ref[:key]) }
+          end
+        end
 
         def determine_visible_nodes(frustum)
           return [] unless index_builder.root
@@ -61,25 +85,31 @@ module PointCloudPlugin
           end
         end
 
-        def ordered_keys_for_nodes(nodes)
-          nodes.flat_map { |node| node.chunk_refs.map { |ref| ref[:key] } }.uniq
+        def ordered_keys_for_nodes(nodes, visible_chunk_keys = nil)
+          nodes.flat_map do |node|
+            filtered_chunk_refs(node, visible_chunk_keys).map { |ref| ref[:key] }
+          end.uniq
         end
 
-        def allocate_chunk_requests(nodes, quotas)
+        def allocate_chunk_requests(nodes, quotas, visible_chunk_keys)
+          visible_set = visible_chunk_keys && Array(visible_chunk_keys).compact.to_set
           requests = Hash.new(0)
 
           nodes.each do |node|
-            node_quota = quotas[node].to_i
-            next if node_quota <= 0 || node.chunk_refs.empty?
+            chunk_refs = filtered_chunk_refs(node, visible_set)
+            next if chunk_refs.empty?
 
-            total_points = node.chunk_refs.sum { |ref| ref[:point_count] }
+            node_quota = quotas[node].to_i
+            next if node_quota <= 0
+
+            total_points = chunk_refs.sum { |ref| ref[:point_count] }
             next if total_points <= 0
 
             remaining = node_quota
 
-            node.chunk_refs.each_with_index do |ref, index|
+            chunk_refs.each_with_index do |ref, index|
               share =
-                if index == node.chunk_refs.length - 1
+                if index == chunk_refs.length - 1
                   remaining
                 else
                   ((node_quota * ref[:point_count]) / total_points.to_f).floor
@@ -93,6 +123,12 @@ module PointCloudPlugin
           end
 
           requests
+        end
+
+        def filtered_chunk_refs(node, visible_keys)
+          return node.chunk_refs unless visible_keys
+
+          node.chunk_refs.select { |ref| visible_keys.include?(ref[:key]) }
         end
 
         def build_chunk_list(requests)
