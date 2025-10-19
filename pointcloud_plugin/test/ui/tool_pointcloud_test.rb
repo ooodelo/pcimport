@@ -12,6 +12,10 @@ module PointCloudPlugin
         def size
           0
         end
+
+        def empty?
+          false
+        end
       end
 
       class SampleChunk
@@ -158,6 +162,24 @@ module PointCloudPlugin
         view = FakeView.new(modelview, projection)
         invisible_chunk = FakeChunk.new({ bounds: { min: [-0.5, -0.5, 1.0], max: [0.5, 0.5, 2.0] } })
         pipeline = FakePipeline.new([['chunk', invisible_chunk]])
+        prefetcher = FakePrefetcher.new
+        cloud = FakeCloud.new(1, pipeline, prefetcher)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+        tool.send(:gather_chunks, view)
+
+        assert_empty tool.instance_variable_get(:@active_chunks)
+        assert_equal 1, prefetcher.visible_calls.size
+        assert_empty prefetcher.visible_calls.first
+      end
+
+      def test_chunk_without_bounds_is_ignored
+        projection = identity_matrix
+        modelview = identity_matrix
+        view = FakeView.new(modelview, projection)
+        missing_bounds_chunk = FakeChunk.new({})
+        pipeline = FakePipeline.new([['chunk', missing_bounds_chunk]])
         prefetcher = FakePrefetcher.new
         cloud = FakeCloud.new(1, pipeline, prefetcher)
         manager = FakeManager.new([cloud])

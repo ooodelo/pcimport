@@ -238,11 +238,14 @@ module PointCloudPlugin
             chunk = nil
           end
 
+          return if chunk && empty_chunk?(chunk)
+
           bounds ||= chunk_bounds(chunk)
           bounds ||= bounds_from_index(key, root)
           bounds ||= bounds_from_visibility(view, key)
 
           return unless key
+          return unless bounds_valid?(bounds)
 
           { key: key, bounds: bounds }
         end
@@ -252,20 +255,53 @@ module PointCloudPlugin
 
           node = @index_builder.node_for(key)
           reference = node&.chunk_refs&.find { |ref| ref[:key] == key }
-          reference && reference[:bounds]
+          bounds = reference && reference[:bounds]
+          bounds if bounds_valid?(bounds)
         end
 
         def bounds_from_visibility(view, key)
           return unless view
           return unless view.respond_to?(:chunk_bounds)
 
-          view.chunk_bounds(key)
+          bounds = view.chunk_bounds(key)
+          bounds if bounds_valid?(bounds)
         rescue StandardError
           nil
         end
 
         def chunk_bounds(chunk)
-          chunk&.metadata && chunk.metadata[:bounds]
+          return if empty_chunk?(chunk)
+
+          bounds = chunk&.metadata && (chunk.metadata[:bounds] || chunk.metadata['bounds'])
+          bounds if bounds_valid?(bounds)
+        end
+
+        def empty_chunk?(chunk)
+          return true if chunk.respond_to?(:empty?) && chunk.empty?
+
+          metadata = chunk.respond_to?(:metadata) ? chunk.metadata : nil
+          metadata.is_a?(Hash) && (metadata[:empty] || metadata['empty'])
+        end
+
+        def bounds_valid?(bounds)
+          return false unless bounds.is_a?(Hash)
+
+          min = bounds[:min] || bounds['min']
+          max = bounds[:max] || bounds['max']
+          return false unless min.is_a?(Array) && max.is_a?(Array)
+          return false unless min.length >= 3 && max.length >= 3
+
+          (0..2).all? do |axis|
+            mn = min[axis]
+            mx = max[axis]
+            next false if mn.nil? || mx.nil?
+
+            numeric?(mn) && numeric?(mx)
+          end
+        end
+
+        def numeric?(value)
+          value.respond_to?(:to_f)
         end
 
         def include_candidate?(cosine, camera_forward, camera_position)

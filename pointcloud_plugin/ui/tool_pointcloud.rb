@@ -361,9 +361,36 @@ module PointCloudPlugin
 
       SCREEN_MARGIN = 32
 
+      def empty_metadata?(metadata)
+        return false unless metadata.is_a?(Hash)
+
+        metadata[:empty] || metadata['empty'] ? true : false
+      end
+
+      def extract_bounds(source)
+        return unless source
+
+        bounds =
+          if source.is_a?(Hash) && (source.key?(:min) || source.key?('min'))
+            source
+          elsif source.is_a?(Hash)
+            source[:bounds] || source['bounds']
+          end
+
+        return unless bounds_valid?(bounds)
+
+        bounds
+      end
+
       def chunk_visible?(chunk, frustum, view)
+        return false if chunk.respond_to?(:empty?) && chunk.empty?
+
         metadata = chunk.respond_to?(:metadata) ? chunk.metadata : nil
-        bounds = metadata && (metadata[:bounds] || metadata['bounds'])
+        return false if empty_metadata?(metadata)
+
+        bounds = extract_bounds(metadata)
+        return false unless bounds
+
         visible_bounds?(bounds, frustum, view)
       end
 
@@ -378,7 +405,8 @@ module PointCloudPlugin
             key = ref[:key] || ref['key']
             next unless key
 
-            bounds = ref[:bounds] || ref['bounds']
+            bounds = extract_bounds(ref)
+            next unless bounds
             next unless visible_bounds?(bounds, frustum, view)
 
             { key: key, bounds: bounds }
@@ -391,12 +419,12 @@ module PointCloudPlugin
       end
 
       def visible_bounds?(bounds, frustum, view)
-        return true unless bounds
+        return false unless bounds_valid?(bounds)
 
         visible = screen_culling_visibility(view, bounds)
         return visible unless visible.nil?
 
-        return true unless frustum
+        return false unless frustum
 
         frustum.intersects_bounds?(bounds)
       end
@@ -435,6 +463,23 @@ module PointCloudPlugin
 
       AXIS_INDEX = { x: 0, y: 1, z: 2 }.freeze
 
+      def bounds_valid?(bounds)
+        return false unless bounds.is_a?(Hash)
+
+        min = bounds[:min] || bounds['min']
+        max = bounds[:max] || bounds['max']
+        return false unless min.is_a?(Array) && max.is_a?(Array)
+        return false unless min.length >= 3 && max.length >= 3
+
+        (0..2).all? do |axis|
+          mn = min[axis]
+          mx = max[axis]
+          next false if mn.nil? || mx.nil?
+
+          numeric?(mn) && numeric?(mx)
+        end
+      end
+
       def screen_point_visible?(screen_point, viewport)
         return false unless screen_point && viewport
 
@@ -463,6 +508,10 @@ module PointCloudPlugin
             zs.map { |z| build_point3d(x, y, z) }
           end
         end
+      end
+
+      def numeric?(value)
+        value.respond_to?(:to_f)
       end
 
       def build_point3d(x, y, z)

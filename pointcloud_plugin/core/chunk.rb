@@ -14,7 +14,7 @@ module PointCloudPlugin
         @positions = positions
         @colors = colors || { r: [], g: [], b: [] }
         @intensities = intensities || []
-        @metadata = metadata
+        @metadata = metadata || {}
       end
 
       def size
@@ -33,6 +33,13 @@ module PointCloudPlugin
 
       def has_intensity?
         intensities&.compact&.any?
+      end
+
+      def empty?
+        flag = metadata && (metadata[:empty] || metadata['empty'])
+        return true if flag
+
+        count.zero?
       end
 
       HEADER_BYTES = 64
@@ -85,7 +92,15 @@ module PointCloudPlugin
       end
 
       def pack(points)
-        return Chunk.new(origin: [0.0, 0.0, 0.0], scale: 1.0, positions: { x: [], y: [], z: [] }) if points.empty?
+        if points.empty?
+          metadata = { empty: true, quantization_bits: @quantization_bits }
+          return Chunk.new(
+            origin: [0.0, 0.0, 0.0],
+            scale: 1.0,
+            positions: { x: [], y: [], z: [] },
+            metadata: metadata
+          )
+        end
 
         normalized_points = points.map do |point|
           normalized_position = Core::Units.normalize_point(point[:position], from: @input_unit)
