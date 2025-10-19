@@ -45,15 +45,22 @@ module PointCloudPlugin
       end
 
       class FakePipeline
-        attr_reader :chunk_store
+        attr_reader :chunk_store, :reservoir
 
-        def initialize(chunks)
+        def initialize(chunks, reservoir: nil)
           @chunks = chunks
           @chunk_store = Object.new
+          @reservoir = reservoir || EmptyReservoir.new
         end
 
         def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil)
           @chunks
+        end
+
+        class EmptyReservoir
+          def sample_all(_limit = nil)
+            []
+          end
         end
       end
 
@@ -83,6 +90,10 @@ module PointCloudPlugin
         def initialize(modelview, projection, eye = [0.0, 0.0, 0.0])
           @camera = FakeCamera.new(modelview, projection, eye)
         end
+
+        def pickray(_x, _y)
+          [[0.0, 0.0, 10.0], [0.0, 0.0, -1.0]]
+        end
       end
 
       def test_invisible_chunk_is_rejected
@@ -101,6 +112,33 @@ module PointCloudPlugin
         assert_empty tool.instance_variable_get(:@active_chunks)
         assert_equal 1, prefetcher.frustums.size
         assert_equal 6, prefetcher.frustums.first.planes.size
+      end
+
+      def test_update_snap_target_uses_reservoir_samples
+        projection = identity_matrix
+        modelview = identity_matrix
+        view = FakeView.new(modelview, projection)
+
+        sample_point = { position: [0.0, 0.0, 0.0] }
+        reservoir = Class.new do
+          def initialize(samples)
+            @samples = samples
+          end
+
+          def sample_all(_limit = nil)
+            @samples
+          end
+        end.new([sample_point])
+
+        pipeline = FakePipeline.new([], reservoir: reservoir)
+        cloud = FakeCloud.new(1, pipeline, Object.new)
+        manager = FakeManager.new([cloud])
+
+        tool = ToolPointCloud.new(manager)
+
+        tool.send(:update_snap_target, view, 0, 0)
+
+        assert_equal sample_point, tool.instance_variable_get(:@snap_target)
       end
 
       private
