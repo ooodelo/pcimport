@@ -80,7 +80,7 @@ module PointCloudPlugin
     return if @menu_created
 
     MENU_PARENT_LABELS.each do |parent_label|
-      parent_menu = safe_menu(parent_label)
+      parent_menu = menu_for(parent_label)
       next unless parent_menu
 
       submenu = parent_menu.add_submenu(MENU_TITLE)
@@ -124,11 +124,17 @@ module PointCloudPlugin
     raise
   end
 
-  def safe_menu(label)
-    ::UI.menu(label)
+  def menu_for(label)
+    menu = ::UI.menu(label)
+    unless menu
+      log("Menu '#{label}' is unavailable; skipping registration")
+      return nil
+    end
+    menu
   rescue StandardError => e
     log("Failed to access '#{label}' menu: #{e.class}: #{e.message}")
-    nil
+    log(e.backtrace.join("\n")) if e.backtrace
+    raise
   end
 
   def start_import
