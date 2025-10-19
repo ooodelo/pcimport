@@ -20,6 +20,7 @@ module PointCloudPlugin
         @progress = 0.0
         @chunk_index = 0
         @thread = nil
+        @preview_ready = false
       end
 
       def start(&block)
@@ -50,6 +51,7 @@ module PointCloudPlugin
           first_chunk = (@chunk_index.zero?)
           key = next_key
           pipeline.submit_chunk(key, chunk)
+          preview_became_ready = mark_preview_ready(first_chunk)
           @progress = total_points
 
           progress_percent = if estimated_total && estimated_total.positive?
@@ -67,7 +69,8 @@ module PointCloudPlugin
               total_points: total_points,
               estimated_total: estimated_total,
               progress_percent: progress_percent,
-              first_chunk: first_chunk
+              first_chunk: first_chunk,
+              preview_ready: preview_ready?
             )
 
             unless first_chunk_shown
@@ -88,7 +91,8 @@ module PointCloudPlugin
               bytes_processed: bytes_processed
             )
 
-            MainThreadQueue.post { Sketchup.active_model.active_view.invalidate }
+            activate_preview_layer if preview_became_ready
+            invalidate_active_view
           end
         end
 
@@ -115,7 +119,7 @@ module PointCloudPlugin
         end
       end
 
-      def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false)
+      def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false, preview_ready: false)
         # Hook for UI updates; by default does nothing but can be extended.
         if respond_to?(:on_chunk)
           begin
@@ -125,12 +129,17 @@ module PointCloudPlugin
               total_points: total_points,
               estimated_total: estimated_total,
               progress_percent: progress_percent,
-              first_chunk: first_chunk
+              first_chunk: first_chunk,
+              preview_ready: preview_ready
             )
           rescue ArgumentError
             on_chunk(key, chunk)
           end
         end
+      end
+
+      def preview_ready?
+        @preview_ready
       end
 
       def estimate_total_points(size_in_bytes = nil)
@@ -344,6 +353,43 @@ module PointCloudPlugin
       def next_key
         @chunk_index += 1
         "chunk_#{@chunk_index}_#{SecureRandom.hex(4)}"
+      end
+
+      def mark_preview_ready(first_chunk)
+        return false unless first_chunk
+        return false if preview_ready?
+
+        @preview_ready = true
+        true
+      end
+
+      def activate_preview_layer
+        return unless defined?(PointCloudPlugin)
+
+        tool = PointCloudPlugin.respond_to?(:tool) ? PointCloudPlugin.tool : nil
+        return unless tool
+
+        if tool.respond_to?(:preview_ready=)
+          tool.preview_ready = true
+        elsif tool.respond_to?(:enable_preview!)
+          tool.enable_preview!
+        else
+          tool.instance_variable_set(:@preview_ready, true)
+        end
+      rescue StandardError => e
+        warn("Failed to activate preview layer: #{e.class}: #{e.message}")
+      end
+
+      def invalidate_active_view
+        return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+        model = Sketchup.active_model
+        view = model&.active_view
+        return unless view && view.respond_to?(:invalidate)
+
+        view.invalidate
+      rescue StandardError => e
+        warn("Failed to invalidate active view: #{e.class}: #{e.message}")
       end
     end
   end
