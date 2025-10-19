@@ -15,6 +15,7 @@ module PointCloudPlugin
         @max_in_memory = max_in_memory
         @entries = {}
         @lru = []
+        @on_remove_callbacks = []
         FileUtils.mkdir_p(cache_path)
       end
 
@@ -54,7 +55,10 @@ module PointCloudPlugin
       end
 
       def flush!
-        @entries.each { |key, chunk| persist_to_disk(key, chunk) }
+        @entries.each do |key, chunk|
+          persist_to_disk(key, chunk)
+          notify_removed(key)
+        end
         @entries.clear
         @lru.clear
       end
@@ -62,6 +66,13 @@ module PointCloudPlugin
       def release(key)
         @entries.delete(key)
         @lru.delete(key)
+        notify_removed(key)
+      end
+
+      def on_remove(&block)
+        return unless block
+
+        @on_remove_callbacks << block
       end
 
       private
@@ -83,7 +94,12 @@ module PointCloudPlugin
         while @lru.size > max_in_memory
           key = @lru.pop
           @entries.delete(key)
+          notify_removed(key)
         end
+      end
+
+      def notify_removed(key)
+        @on_remove_callbacks.each { |callback| callback.call(key) }
       end
     end
   end
