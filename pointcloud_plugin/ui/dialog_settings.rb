@@ -6,12 +6,46 @@ module PointCloudPlugin
   module UI
     # Settings dialog for adjusting runtime parameters.
     class DialogSettings
+      DEFAULT_MODE = :navigation
+
+      PRESETS = {
+        navigation: {
+          label: 'Наведение',
+          hint: 'Наведение: плавность выше, точек меньше, точки крупнее.',
+          budget: 1_200_000,
+          point_size: 3,
+          prefetch_limit: 16,
+          prefetch_angle_weight: 6.0,
+          prefetch_distance_weight: 1.0,
+          prefetch_forward_threshold: 0.3,
+          preview_threshold: 0.05
+        },
+        detail: {
+          label: 'Детализация',
+          hint: 'Детализация: деталей больше, FPS может снизиться, точки мельче.',
+          budget: 3_000_000,
+          point_size: 1,
+          prefetch_limit: 40,
+          prefetch_angle_weight: 14.0,
+          prefetch_distance_weight: 1.0,
+          prefetch_forward_threshold: -0.1,
+          preview_threshold: 0.18
+        }
+      }.freeze
+
       DEFAULTS = {
-        budget: 2_000_000,
-        point_size: 2,
+        mode: DEFAULT_MODE,
+        preset_customized: false,
+        budget: PRESETS[DEFAULT_MODE][:budget],
+        point_size: PRESETS[DEFAULT_MODE][:point_size],
         snap_radius: 5.0,
         memory_limit: 512,
-        monochrome: false
+        monochrome: false,
+        prefetch_limit: PRESETS[DEFAULT_MODE][:prefetch_limit],
+        prefetch_angle_weight: PRESETS[DEFAULT_MODE][:prefetch_angle_weight],
+        prefetch_distance_weight: PRESETS[DEFAULT_MODE][:prefetch_distance_weight],
+        prefetch_forward_threshold: PRESETS[DEFAULT_MODE][:prefetch_forward_threshold],
+        preview_threshold: PRESETS[DEFAULT_MODE][:preview_threshold]
       }.freeze
 
       IMPORT_UNITS = [
@@ -43,10 +77,23 @@ module PointCloudPlugin
       private
 
       def build_dialog
-        dialog = ::UI::HtmlDialog.new(dialog_title: 'Point Cloud Settings', width: 360, height: 360)
+        dialog = ::UI::HtmlDialog.new(dialog_title: 'Point Cloud Settings', width: 380, height: 420)
         budget_millions = (settings[:budget].to_f / 1_000_000.0)
         budget_display = format('%.1f', budget_millions)
         monochrome_checked = settings[:monochrome] ? 'checked' : ''
+        mode_symbol = normalize_mode(settings[:mode])
+        current_mode = mode_symbol.to_s
+        preset = preset_for(mode_symbol)
+        presets_json = JSON.generate(serializable_presets)
+        current_prefetch = {
+          limit: settings[:prefetch_limit] || preset[:prefetch_limit],
+          angleWeight: settings[:prefetch_angle_weight] || preset[:prefetch_angle_weight],
+          distanceWeight: settings[:prefetch_distance_weight] || preset[:prefetch_distance_weight],
+          forwardThreshold: settings[:prefetch_forward_threshold] || preset[:prefetch_forward_threshold],
+          previewThreshold: settings[:preview_threshold] || preset[:preview_threshold]
+        }
+        current_prefetch_json = JSON.generate(current_prefetch)
+        customized_flag = settings[:preset_customized] ? 'true' : 'false'
 
         html = <<~HTML
           <html>
@@ -56,46 +103,158 @@ module PointCloudPlugin
                 label { display: block; margin-bottom: 12px; }
                 .section { margin-bottom: 24px; }
                 .slider-row { display: flex; align-items: center; gap: 12px; }
-                .slider-row span { min-width: 110px; font-weight: bold; }
+                .slider-row span { min-width: 140px; font-weight: bold; }
                 .buttons { display: flex; gap: 12px; }
+                .mode-toggle { display: inline-flex; border: 1px solid #889; border-radius: 18px; overflow: hidden; }
+                .mode-button { border: none; background: transparent; padding: 6px 16px; cursor: pointer; font-weight: 600; font-size: 13px; }
+                .mode-button.active { background: #2f74ff; color: #fff; }
+                .mode-button:not(.active):hover { background: rgba(47, 116, 255, 0.12); }
+                .mode-hint { margin-top: 8px; font-size: 12px; color: #333; line-height: 1.4; }
+                .mode-custom { margin-top: 6px; font-size: 11px; color: #aa5500; display: none; }
+                #panic_button { margin-top: 8px; }
               </style>
             </head>
             <body>
               <div class="section">
-                <label>Frame budget</label>
-                <div class="slider-row">
-                  <input id="budget_slider" type="range" min="0.5" max="5" step="0.1" value="#{budget_display}">
-                  <span id="budget_value">#{budget_display} M points</span>
+                <label>Режим просмотра</label>
+                <div class="mode-toggle" role="group" aria-label="Режим просмотра">
+                  <button class="mode-button" type="button" data-mode="navigation">Наведение</button>
+                  <button class="mode-button" type="button" data-mode="detail">Детализация</button>
                 </div>
-                <button id="panic_button" type="button">Panic</button>
+                <div class="mode-hint" id="mode_hint"></div>
+                <div class="mode-custom" id="mode_custom_hint"></div>
               </div>
               <div class="section">
-                <label>Point size: <input id="point_size" type="number" min="1" value="#{settings[:point_size]}"></label>
-                <label>Snap radius: <input id="snap_radius" type="number" step="0.1" value="#{settings[:snap_radius]}"></label>
-                <label>Memory limit (MB): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label>
-                <label><input id="monochrome" type="checkbox" #{monochrome_checked}> Monochrome</label>
+                <label>Бюджет точек на кадр</label>
+                <div class="slider-row">
+                  <input id="budget_slider" type="range" min="0.5" max="5" step="0.1" value="#{budget_display}">
+                  <span id="budget_value">#{budget_display} M точек</span>
+                </div>
+                <button id="panic_button" type="button">Паника</button>
+              </div>
+              <div class="section">
+                <label>Размер точки: <input id="point_size" type="number" min="1" max="9" value="#{settings[:point_size]}"></label>
+                <label>Радиус привязки: <input id="snap_radius" type="number" step="0.1" value="#{settings[:snap_radius]}"></label>
+                <label>Лимит памяти (МБ): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label>
+                <label><input id="monochrome" type="checkbox" #{monochrome_checked}> Монохром</label>
               </div>
               <div class="buttons">
-                <button id="apply_button" type="button">Apply</button>
-                <button id="cancel_button" type="button">Cancel</button>
+                <button id="apply_button" type="button">Применить</button>
+                <button id="cancel_button" type="button">Закрыть</button>
               </div>
               <script>
                 (function() {
+                  const PRESETS = #{presets_json};
+                  let currentMode = '#{current_mode}';
+                  let presetCustomized = #{customized_flag};
+                  let currentPrefetch = #{current_prefetch_json};
+                  let isApplyingPreset = false;
+
                   const slider = document.getElementById('budget_slider');
                   const display = document.getElementById('budget_value');
                   const panicButton = document.getElementById('panic_button');
                   const applyButton = document.getElementById('apply_button');
                   const cancelButton = document.getElementById('cancel_button');
+                  const pointSizeInput = document.getElementById('point_size');
+                  const snapRadiusInput = document.getElementById('snap_radius');
+                  const memoryLimitInput = document.getElementById('memory_limit');
+                  const monochromeInput = document.getElementById('monochrome');
+                  const modeHint = document.getElementById('mode_hint');
+                  const customHint = document.getElementById('mode_custom_hint');
+                  const modeButtons = Array.prototype.slice.call(document.querySelectorAll('.mode-button'));
 
                   function updateDisplay() {
                     const value = parseFloat(slider.value);
-                    display.textContent = value.toFixed(1) + ' M points';
+                    display.textContent = value.toFixed(1) + ' M точек';
                   }
 
-                  slider.addEventListener('input', updateDisplay);
-                  updateDisplay();
+                  function updateModeButtons() {
+                    modeButtons.forEach((button) => {
+                      const active = button.dataset.mode === currentMode;
+                      button.classList.toggle('active', active);
+                    });
+                  }
 
-                  panicButton.addEventListener('click', function() {
+                  function updateHints() {
+                    const preset = PRESETS[currentMode];
+                    if (preset && modeHint) {
+                      modeHint.textContent = preset.hint || '';
+                    }
+                    if (customHint) {
+                      if (presetCustomized) {
+                        customHint.textContent = 'Ручная корректировка активна — переключите режим, чтобы вернуть базовые значения.';
+                        customHint.style.display = 'block';
+                      } else {
+                        customHint.textContent = '';
+                        customHint.style.display = 'none';
+                      }
+                    }
+                  }
+
+                  function submitSettings() {
+                    const payload = {
+                      mode: currentMode,
+                      preset_customized: presetCustomized,
+                      budget: Math.round(parseFloat(slider.value) * 1000000),
+                      point_size: parseInt(pointSizeInput.value, 10),
+                      snap_radius: parseFloat(snapRadiusInput.value),
+                      memory_limit: parseInt(memoryLimitInput.value, 10),
+                      monochrome: monochromeInput.checked,
+                      prefetch_limit: currentPrefetch.limit,
+                      prefetch_angle_weight: currentPrefetch.angleWeight,
+                      prefetch_distance_weight: currentPrefetch.distanceWeight,
+                      prefetch_forward_threshold: currentPrefetch.forwardThreshold,
+                      preview_threshold: currentPrefetch.previewThreshold
+                    };
+
+                    if (window.sketchup && typeof window.sketchup.apply === 'function') {
+                      window.sketchup.apply(JSON.stringify(payload));
+                    }
+                  }
+
+                  function applyPreset(mode) {
+                    const preset = PRESETS[mode];
+                    if (!preset) {
+                      return;
+                    }
+                    currentMode = mode;
+                    isApplyingPreset = true;
+                    slider.value = (preset.budget / 1000000).toFixed(1);
+                    updateDisplay();
+                    pointSizeInput.value = preset.point_size;
+                    isApplyingPreset = false;
+                    currentPrefetch = {
+                      limit: preset.prefetch_limit,
+                      angleWeight: preset.prefetch_angle_weight,
+                      distanceWeight: preset.prefetch_distance_weight,
+                      forwardThreshold: preset.prefetch_forward_threshold,
+                      previewThreshold: preset.preview_threshold
+                    };
+                    presetCustomized = false;
+                    updateModeButtons();
+                    updateHints();
+                    submitSettings();
+                  }
+
+                  function markCustomized() {
+                    presetCustomized = true;
+                    updateHints();
+                  }
+
+                  slider.addEventListener('input', () => {
+                    updateDisplay();
+                    if (!isApplyingPreset) {
+                      markCustomized();
+                    }
+                  });
+
+                  pointSizeInput.addEventListener('input', () => {
+                    if (!isApplyingPreset) {
+                      markCustomized();
+                    }
+                  });
+
+                  panicButton.addEventListener('click', () => {
                     const min = parseFloat(slider.min);
                     const current = parseFloat(slider.value);
                     const next = Math.max(min, current / 2);
@@ -103,22 +262,24 @@ module PointCloudPlugin
                     slider.dispatchEvent(new Event('input'));
                   });
 
-                  applyButton.addEventListener('click', function() {
-                    const payload = {
-                      budget: Math.round(parseFloat(slider.value) * 1000000),
-                      point_size: parseInt(document.getElementById('point_size').value, 10),
-                      snap_radius: parseFloat(document.getElementById('snap_radius').value),
-                      memory_limit: parseInt(document.getElementById('memory_limit').value, 10),
-                      monochrome: document.getElementById('monochrome').checked
-                    };
-                    if (window.sketchup && typeof window.sketchup.apply === 'function') {
-                      window.sketchup.apply(JSON.stringify(payload));
-                    }
+                  modeButtons.forEach((button) => {
+                    button.addEventListener('click', () => {
+                      const mode = button.dataset.mode;
+                      if (mode && mode !== currentMode) {
+                        applyPreset(mode);
+                      }
+                    });
                   });
 
-                  cancelButton.addEventListener('click', function() {
+                  applyButton.addEventListener('click', submitSettings);
+
+                  cancelButton.addEventListener('click', () => {
                     window.close();
                   });
+
+                  updateDisplay();
+                  updateModeButtons();
+                  updateHints();
                 })();
               </script>
             </body>
@@ -133,7 +294,6 @@ module PointCloudPlugin
         end
         dialog
       end
-
       def show_import_dialog(initial_options = {})
         overrides = initial_options || {}
         defaults = merge_import_defaults(import_options.merge(overrides))
@@ -269,6 +429,38 @@ module PointCloudPlugin
 
       private
 
+      def serializable_presets
+        PRESETS.transform_values do |preset|
+          {
+            label: preset[:label],
+            hint: preset[:hint],
+            budget: preset[:budget],
+            point_size: preset[:point_size],
+            prefetch_limit: preset[:prefetch_limit],
+            prefetch_angle_weight: preset[:prefetch_angle_weight],
+            prefetch_distance_weight: preset[:prefetch_distance_weight],
+            prefetch_forward_threshold: preset[:prefetch_forward_threshold],
+            preview_threshold: preset[:preview_threshold]
+          }
+        end
+      end
+
+      def preset_for(mode)
+        PRESETS[normalize_mode(mode)]
+      end
+
+      def normalize_mode(value, fallback = DEFAULT_MODE)
+        symbol =
+          case value
+          when Symbol then value
+          when String then value.to_s.strip.downcase.to_sym
+          else
+            fallback || DEFAULT_MODE
+          end
+
+        PRESETS.key?(symbol) ? symbol : fallback || DEFAULT_MODE
+      end
+
       def notify_runtime_change
         snapshot = @settings.dup
         @on_change&.call(snapshot)
@@ -292,13 +484,44 @@ module PointCloudPlugin
         data = raw.is_a?(Hash) ? raw : {}
         data = data.transform_keys { |key| key.to_s.downcase.to_sym }
 
-        {
-          budget: clamp_integer(fetch_numeric(data, :budget, settings[:budget]), 100_000, 10_000_000),
-          point_size: clamp_integer(fetch_numeric(data, :point_size, settings[:point_size]), 1, 9),
+        mode = normalize_mode(data[:mode], settings[:mode] || DEFAULT_MODE)
+        preset = preset_for(mode)
+        customized = fetch_boolean(data, :preset_customized, settings[:preset_customized])
+
+        budget_fallback = settings[:budget] || preset[:budget]
+        point_size_fallback = settings[:point_size] || preset[:point_size]
+        prefetch_limit_fallback = settings[:prefetch_limit] || preset[:prefetch_limit]
+        angle_fallback = settings[:prefetch_angle_weight] || preset[:prefetch_angle_weight]
+        distance_fallback = settings[:prefetch_distance_weight] || preset[:prefetch_distance_weight]
+        forward_fallback = settings[:prefetch_forward_threshold] || preset[:prefetch_forward_threshold]
+        preview_fallback = settings[:preview_threshold] || preset[:preview_threshold]
+
+        normalized = {
+          mode: mode,
+          preset_customized: customized,
+          budget: clamp_integer(fetch_numeric(data, :budget, customized ? budget_fallback : preset[:budget]), 100_000, 10_000_000),
+          point_size: clamp_integer(fetch_numeric(data, :point_size, customized ? point_size_fallback : preset[:point_size]), 1, 9),
           snap_radius: clamp_float(fetch_numeric(data, :snap_radius, settings[:snap_radius]), 0.1, 1000.0),
           memory_limit: clamp_integer(fetch_numeric(data, :memory_limit, settings[:memory_limit]), 128, 65_536),
-          monochrome: fetch_boolean(data, :monochrome, settings[:monochrome])
+          monochrome: fetch_boolean(data, :monochrome, settings[:monochrome]),
+          prefetch_limit: clamp_integer(fetch_numeric(data, :prefetch_limit, customized ? prefetch_limit_fallback : preset[:prefetch_limit]), 4, 128),
+          prefetch_angle_weight: clamp_float(fetch_numeric(data, :prefetch_angle_weight, customized ? angle_fallback : preset[:prefetch_angle_weight]), 0.1, 50.0),
+          prefetch_distance_weight: clamp_float(fetch_numeric(data, :prefetch_distance_weight, customized ? distance_fallback : preset[:prefetch_distance_weight]), 0.1, 10.0),
+          prefetch_forward_threshold: clamp_float(fetch_numeric(data, :prefetch_forward_threshold, customized ? forward_fallback : preset[:prefetch_forward_threshold]), -1.0, 1.0),
+          preview_threshold: clamp_float(fetch_numeric(data, :preview_threshold, customized ? preview_fallback : preset[:preview_threshold]), 0.0, 1.0)
         }
+
+        unless customized
+          normalized[:budget] = preset[:budget]
+          normalized[:point_size] = preset[:point_size]
+          normalized[:prefetch_limit] = preset[:prefetch_limit]
+          normalized[:prefetch_angle_weight] = preset[:prefetch_angle_weight]
+          normalized[:prefetch_distance_weight] = preset[:prefetch_distance_weight]
+          normalized[:prefetch_forward_threshold] = preset[:prefetch_forward_threshold]
+          normalized[:preview_threshold] = preset[:preview_threshold]
+        end
+
+        normalized
       end
 
       def fetch_numeric(data, key, default)

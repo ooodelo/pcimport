@@ -207,6 +207,35 @@ module PointCloudPlugin
       end
     end
 
+    prefetch_limit = symbolized[:prefetch_limit]
+    angle_weight = symbolized[:prefetch_angle_weight]
+    distance_weight = symbolized[:prefetch_distance_weight]
+    forward_threshold = symbolized[:prefetch_forward_threshold]
+    preview_threshold = symbolized[:preview_threshold]
+
+    manager.each_cloud do |cloud|
+      if cloud.prefetcher&.respond_to?(:configure)
+        begin
+          cloud.prefetcher.configure(
+            max_prefetch: prefetch_limit,
+            angle_weight: angle_weight,
+            distance_weight: distance_weight,
+            forward_threshold: forward_threshold
+          )
+        rescue StandardError => e
+          log("Failed to update prefetcher for cloud #{cloud.id}: #{e.message}")
+        end
+      end
+
+      if preview_threshold && cloud.job&.respond_to?(:preview_activation_ratio=)
+        begin
+          cloud.job.preview_activation_ratio = preview_threshold
+        rescue StandardError => e
+          log("Failed to update preview threshold for cloud #{cloud.id}: #{e.message}")
+        end
+      end
+    end
+
     invalidate_active_view
   end
 

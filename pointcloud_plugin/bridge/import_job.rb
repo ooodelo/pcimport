@@ -10,8 +10,11 @@ module PointCloudPlugin
   module Bridge
     # Handles background import of point cloud files and forwards chunks to the core pipeline.
     class ImportJob
+      DEFAULT_PREVIEW_THRESHOLD = 0.12
+
       attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
       attr_accessor :cloud_id
+      attr_reader :preview_activation_ratio
 
       def initialize(path:, reader:, pipeline:, queue: MainThreadQueue.new)
         @path = path
@@ -26,6 +29,7 @@ module PointCloudPlugin
         @completion_status = :pending
         @stage_progress = { reading: 0.0, preparing: 0.0, visualizing: 0.0 }
         @cancelled = false
+        @preview_activation_ratio = DEFAULT_PREVIEW_THRESHOLD
       end
 
       def start(&block)
@@ -76,7 +80,7 @@ module PointCloudPlugin
 
           key = next_key
           pipeline.submit_chunk(key, chunk)
-          preview_became_ready = mark_preview_ready(first_chunk)
+          preview_became_ready = mark_preview_ready(first_chunk: first_chunk, ratio: ratio)
           transition_state(:visualizing) if preview_became_ready
           update_stage_progress(:visualizing, ratio) if preview_ready?
 
@@ -379,12 +383,42 @@ module PointCloudPlugin
         "chunk_#{@chunk_index}_#{SecureRandom.hex(4)}"
       end
 
-      def mark_preview_ready(first_chunk)
-        return false unless first_chunk
+      def preview_activation_ratio=(value)
+        numeric =
+          case value
+          when Numeric then value.to_f
+          else
+            begin
+              Float(value)
+            rescue ArgumentError, TypeError
+              nil
+            end
+          end
+
+        @preview_activation_ratio =
+          if numeric.nil?
+            DEFAULT_PREVIEW_THRESHOLD
+          else
+            numeric.clamp(0.0, 1.0)
+          end
+      end
+
+      def mark_preview_ready(first_chunk:, ratio: 0.0)
         return false if preview_ready?
 
-        @preview_ready = true
-        true
+        threshold = @preview_activation_ratio || DEFAULT_PREVIEW_THRESHOLD
+        ratio = ratio.to_f
+
+        if threshold <= 0.0
+          @preview_ready = true if first_chunk || ratio.positive?
+        elsif ratio >= threshold
+          @preview_ready = true
+        elsif !estimated_progress_available?(ratio) && first_chunk
+          # Estimated progress is unavailable; prefer to show something.
+          @preview_ready = true
+        end
+
+        @preview_ready
       end
 
       def activate_preview_layer
@@ -478,6 +512,10 @@ module PointCloudPlugin
         return 0.0 unless estimated_total && estimated_total.positive?
 
         [total_points.to_f / estimated_total, 1.0].min
+      end
+
+      def estimated_progress_available?(ratio)
+        ratio && ratio.positive?
       end
 
       def finalize_stage_completion

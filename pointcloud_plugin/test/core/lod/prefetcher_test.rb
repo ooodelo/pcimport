@@ -84,6 +84,15 @@ module PointCloudPlugin
           assert_equal 2, @index_builder.build_calls
         end
 
+        def test_configure_updates_internal_weights
+          @prefetcher.configure(max_prefetch: 12, angle_weight: 5.5, distance_weight: 2.5, forward_threshold: 0.2)
+
+          assert_equal 12, @prefetcher.max_prefetch
+          assert_in_delta 5.5, @prefetcher.angle_weight
+          assert_in_delta 2.5, @prefetcher.distance_weight
+          assert_in_delta 0.2, @prefetcher.forward_cosine_threshold
+        end
+
         private
 
         def store_chunk(key, center: [0, 0, 0])
