@@ -79,7 +79,7 @@ module PointCloudPlugin
           extended_planes = frustum.planes.map do |plane|
             normal = plane.normal
             offset = dot_product(normal, movement_vector)
-            distance_adjustment = offset.positive? ? offset : 0.0
+            distance_adjustment = offset.negative? ? offset : 0.0
             Spatial::Plane.new(normal.dup, plane.distance - distance_adjustment)
           end
 
