@@ -52,6 +52,31 @@ module PointCloudPlugin
         duplicate['trailing_bytes'] = FileHasher.encode('changed')
         refute FileHasher.signatures_match?(signature, duplicate)
       end
+
+      def test_signatures_do_not_match_when_hash_presence_differs
+        path = File.join(@tmpdir, 'mixed.bin')
+        File.binwrite(path, 'a' * 150)
+
+        hashed = FileHasher.signature_for(path, sample_bytes: 80)
+        sampled = FileHasher.signature_for(path, sample_bytes: 32)
+
+        refute FileHasher.signatures_match?(hashed, sampled)
+      end
+
+      def test_signatures_do_not_match_when_sample_presence_differs
+        path = File.join(@tmpdir, 'sampled.bin')
+        File.binwrite(path, '0123456789' * 64)
+
+        signature = FileHasher.signature_for(path, sample_bytes: 16)
+
+        missing_leading = signature.dup
+        missing_leading.delete('leading_bytes')
+        refute FileHasher.signatures_match?(signature, missing_leading)
+
+        missing_trailing = signature.dup
+        missing_trailing.delete('trailing_bytes')
+        refute FileHasher.signatures_match?(signature, missing_trailing)
+      end
     end
   end
 end

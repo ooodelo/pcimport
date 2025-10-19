@@ -62,19 +62,19 @@ module PointCloudPlugin
 
         expected_hash = expected['hash']
         actual_hash = actual['hash']
-        if expected_hash && actual_hash
-          return false unless expected_hash == actual_hash
-        end
 
-        if expected_hash.nil? || actual_hash.nil?
-          if expected['leading_bytes'] && actual['leading_bytes']
-            return false unless expected['leading_bytes'] == actual['leading_bytes']
-          end
+        return false unless expected_hash.nil? == actual_hash.nil?
+        return false if expected_hash && expected_hash != actual_hash
 
-          if expected['trailing_bytes'] && actual['trailing_bytes']
-            return false unless expected['trailing_bytes'] == actual['trailing_bytes']
-          end
-        end
+        expected_leading = expected['leading_bytes']
+        actual_leading = actual['leading_bytes']
+        return false unless expected_leading.nil? == actual_leading.nil?
+        return false if expected_leading && expected_leading != actual_leading
+
+        expected_trailing = expected['trailing_bytes']
+        actual_trailing = actual['trailing_bytes']
+        return false unless expected_trailing.nil? == actual_trailing.nil?
+        return false if expected_trailing && expected_trailing != actual_trailing
 
         true
       end
