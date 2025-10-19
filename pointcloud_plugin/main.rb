@@ -103,8 +103,14 @@ module PointCloudPlugin
       return
     end
 
-    # Check if toolbar already exists and is set
-    return if @toolbar && defined?(@toolbar)
+    # Reuse toolbar if already initialized and still valid
+    if defined?(@toolbar) && @toolbar
+      if @toolbar.respond_to?(:valid?)
+        return if @toolbar.valid?
+      else
+        return
+      end
+    end
 
     command = ::UI::Command.new(IMPORT_COMMAND_TITLE) do
       start_import
