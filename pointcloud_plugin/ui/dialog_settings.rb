@@ -45,7 +45,9 @@ module PointCloudPlugin
         prefetch_angle_weight: PRESETS[DEFAULT_MODE][:prefetch_angle_weight],
         prefetch_distance_weight: PRESETS[DEFAULT_MODE][:prefetch_distance_weight],
         prefetch_forward_threshold: PRESETS[DEFAULT_MODE][:prefetch_forward_threshold],
-        preview_threshold: PRESETS[DEFAULT_MODE][:preview_threshold]
+        preview_threshold: PRESETS[DEFAULT_MODE][:preview_threshold],
+        preview_show_points: false,
+        preview_anchor_only: false
       }.freeze
 
       IMPORT_UNITS = [
@@ -61,6 +63,7 @@ module PointCloudPlugin
       def initialize
         @settings = DEFAULTS.dup
         @dialog = nil
+        @preview_controls_state = default_preview_controls_state
       end
 
       def show
@@ -72,6 +75,16 @@ module PointCloudPlugin
 
       def on_change(&block)
         @on_change = block
+      end
+
+      def update_preview_controls(available:, show_points: nil, anchors_only: nil)
+        state = preview_controls_state.dup
+        state[:available] = !!available unless available.nil?
+        state[:show_points] = !!show_points unless show_points.nil?
+        state[:anchors_only] = !!anchors_only unless anchors_only.nil?
+        state[:anchors_only] = false unless state[:show_points]
+        @preview_controls_state = state
+        push_preview_state_to_dialog
       end
 
       private
@@ -94,6 +107,12 @@ module PointCloudPlugin
         }
         current_prefetch_json = JSON.generate(current_prefetch)
         customized_flag = settings[:preset_customized] ? 'true' : 'false'
+        preview_state = preview_controls_state
+        preview_state_json = JSON.generate(preview_state)
+        preview_checked = preview_state[:show_points] ? 'checked' : ''
+        preview_disabled = preview_state[:available] ? '' : 'disabled'
+        anchors_checked = preview_state[:anchors_only] ? 'checked' : ''
+        anchors_disabled = (!preview_state[:available] || !preview_state[:show_points]) ? 'disabled' : ''
 
         html = <<~HTML
           <html>
@@ -112,6 +131,10 @@ module PointCloudPlugin
                 .mode-hint { margin-top: 8px; font-size: 12px; color: #333; line-height: 1.4; }
                 .mode-custom { margin-top: 6px; font-size: 11px; color: #aa5500; display: none; }
                 #panic_button { margin-top: 8px; }
+                .preview-controls { border-top: 1px solid #d0d0d0; padding-top: 12px; margin-top: 12px; }
+                .preview-controls label { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+                .preview-controls label.nested { margin-left: 20px; font-weight: normal; }
+                .preview-controls .hint { font-size: 11px; color: #555; margin-top: 4px; }
               </style>
             </head>
             <body>
@@ -138,6 +161,11 @@ module PointCloudPlugin
                 <label>Лимит памяти (МБ): <input id="memory_limit" type="number" min="128" value="#{settings[:memory_limit]}"></label>
                 <label><input id="monochrome" type="checkbox" #{monochrome_checked}> Монохром</label>
               </div>
+              <div class="section preview-controls">
+                <label><input id="preview_points_toggle" type="checkbox" #{preview_checked} #{preview_disabled}> Показать точки предпросмотра</label>
+                <label class="nested"><input id="preview_anchor_toggle" type="checkbox" #{anchors_checked} #{anchors_disabled}> Только опорные точки</label>
+                <div class="hint" id="preview_hint">Точки появятся после подготовки выборки.</div>
+              </div>
               <div class="buttons">
                 <button id="apply_button" type="button">Применить</button>
                 <button id="cancel_button" type="button">Закрыть</button>
@@ -149,6 +177,7 @@ module PointCloudPlugin
                   let presetCustomized = #{customized_flag};
                   let currentPrefetch = #{current_prefetch_json};
                   let isApplyingPreset = false;
+                  let previewState = #{preview_state_json};
 
                   const slider = document.getElementById('budget_slider');
                   const display = document.getElementById('budget_value');
@@ -162,6 +191,9 @@ module PointCloudPlugin
                   const modeHint = document.getElementById('mode_hint');
                   const customHint = document.getElementById('mode_custom_hint');
                   const modeButtons = Array.prototype.slice.call(document.querySelectorAll('.mode-button'));
+                  const previewToggle = document.getElementById('preview_points_toggle');
+                  const anchorToggle = document.getElementById('preview_anchor_toggle');
+                  const previewHint = document.getElementById('preview_hint');
 
                   function updateDisplay() {
                     const value = parseFloat(slider.value);
@@ -191,6 +223,35 @@ module PointCloudPlugin
                     }
                   }
 
+                  function applyPreviewState(state) {
+                    if (!state) {
+                      return;
+                    }
+                    if (typeof state.available === 'boolean') {
+                      previewState.available = state.available;
+                    }
+                    if (typeof state.show_points === 'boolean') {
+                      previewState.show_points = state.show_points;
+                    }
+                    if (typeof state.anchors_only === 'boolean') {
+                      previewState.anchors_only = state.anchors_only;
+                    }
+                    if (!previewState.show_points) {
+                      previewState.anchors_only = false;
+                    }
+                    if (previewToggle) {
+                      previewToggle.disabled = !previewState.available;
+                      previewToggle.checked = !!previewState.show_points;
+                    }
+                    if (anchorToggle) {
+                      anchorToggle.disabled = !previewState.available || !previewState.show_points;
+                      anchorToggle.checked = !!previewState.show_points && !!previewState.anchors_only;
+                    }
+                    if (previewHint) {
+                      previewHint.textContent = previewState.available ? 'Переключение работает без повторного импорта.' : 'Точки появятся после подготовки выборки.';
+                    }
+                  }
+
                   function submitSettings() {
                     const payload = {
                       mode: currentMode,
@@ -204,7 +265,9 @@ module PointCloudPlugin
                       prefetch_angle_weight: currentPrefetch.angleWeight,
                       prefetch_distance_weight: currentPrefetch.distanceWeight,
                       prefetch_forward_threshold: currentPrefetch.forwardThreshold,
-                      preview_threshold: currentPrefetch.previewThreshold
+                      preview_threshold: currentPrefetch.previewThreshold,
+                      preview_show_points: previewState.available ? !!previewState.show_points : false,
+                      preview_anchor_only: previewState.available ? !!previewState.anchors_only : false
                     };
 
                     if (window.sketchup && typeof window.sketchup.apply === 'function') {
@@ -271,6 +334,41 @@ module PointCloudPlugin
                     });
                   });
 
+                  if (previewToggle) {
+                    previewToggle.addEventListener('change', () => {
+                      if (!previewState.available) {
+                        previewToggle.checked = false;
+                        return;
+                      }
+                      previewState.show_points = previewToggle.checked;
+                      if (!previewToggle.checked) {
+                        previewState.anchors_only = false;
+                        if (anchorToggle) {
+                          anchorToggle.checked = false;
+                        }
+                      }
+                      if (anchorToggle) {
+                        anchorToggle.disabled = !previewToggle.checked;
+                      }
+                    });
+                  }
+
+                  if (anchorToggle) {
+                    anchorToggle.addEventListener('change', () => {
+                      previewState.anchors_only = anchorToggle.checked;
+                    });
+                  }
+
+                  window.sketchup = window.sketchup || {};
+                  window.sketchup.previewControls = function(payload) {
+                    try {
+                      const parsed = (typeof payload === 'string') ? JSON.parse(payload) : payload;
+                      applyPreviewState(parsed || {});
+                    } catch (error) {
+                      console.warn('Failed to parse preview state', error);
+                    }
+                  };
+
                   applyButton.addEventListener('click', submitSettings);
 
                   cancelButton.addEventListener('click', () => {
@@ -280,6 +378,7 @@ module PointCloudPlugin
                   updateDisplay();
                   updateModeButtons();
                   updateHints();
+                  applyPreviewState(previewState);
                 })();
               </script>
             </body>
@@ -463,6 +562,7 @@ module PointCloudPlugin
 
       def notify_runtime_change
         snapshot = @settings.dup
+        sync_preview_state_from_settings
         @on_change&.call(snapshot)
 
         return unless defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:apply_runtime_settings)
@@ -508,8 +608,12 @@ module PointCloudPlugin
           prefetch_angle_weight: clamp_float(fetch_numeric(data, :prefetch_angle_weight, customized ? angle_fallback : preset[:prefetch_angle_weight]), 0.1, 50.0),
           prefetch_distance_weight: clamp_float(fetch_numeric(data, :prefetch_distance_weight, customized ? distance_fallback : preset[:prefetch_distance_weight]), 0.1, 10.0),
           prefetch_forward_threshold: clamp_float(fetch_numeric(data, :prefetch_forward_threshold, customized ? forward_fallback : preset[:prefetch_forward_threshold]), -1.0, 1.0),
-          preview_threshold: clamp_float(fetch_numeric(data, :preview_threshold, customized ? preview_fallback : preset[:preview_threshold]), 0.0, 1.0)
+          preview_threshold: clamp_float(fetch_numeric(data, :preview_threshold, customized ? preview_fallback : preset[:preview_threshold]), 0.0, 1.0),
+          preview_show_points: fetch_boolean(data, :preview_show_points, settings[:preview_show_points]),
+          preview_anchor_only: fetch_boolean(data, :preview_anchor_only, settings[:preview_anchor_only])
         }
+
+        normalized[:preview_anchor_only] = false unless normalized[:preview_show_points]
 
         unless customized
           normalized[:budget] = preset[:budget]
@@ -522,6 +626,35 @@ module PointCloudPlugin
         end
 
         normalized
+      end
+
+      def preview_controls_state
+        @preview_controls_state ||= default_preview_controls_state
+      end
+
+      def default_preview_controls_state
+        {
+          available: false,
+          show_points: !!@settings[:preview_show_points],
+          anchors_only: !!@settings[:preview_anchor_only]
+        }
+      end
+
+      def push_preview_state_to_dialog
+        return unless @dialog && @dialog.respond_to?(:execute_script)
+
+        payload = JSON.generate(preview_controls_state)
+        script = "window.sketchup && window.sketchup.previewControls && window.sketchup.previewControls(#{payload})"
+        @dialog.execute_script(script)
+      rescue StandardError
+        nil
+      end
+
+      def sync_preview_state_from_settings
+        state = preview_controls_state
+        state[:show_points] = !!@settings[:preview_show_points]
+        state[:anchors_only] = state[:show_points] && !!@settings[:preview_anchor_only]
+        @preview_controls_state = state
       end
 
       def fetch_numeric(data, key, default)

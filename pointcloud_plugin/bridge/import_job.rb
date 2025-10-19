@@ -7,6 +7,7 @@ require_relative '../core/file_hasher'
 require_relative '../core/lod/pipeline'
 require_relative '../core/sampling/voxel_reservoir_sampler'
 require_relative 'main_thread_queue'
+require_relative '../ui/cpoints_builder'
 
 module PointCloudPlugin
   module Bridge
@@ -174,6 +175,7 @@ module PointCloudPlugin
 
         write_sample_300k(sampler)
         write_preview_sample(preview_accumulator)
+        build_preview_construction_points(sampler&.samples)
 
         transition_state(:build)
         update_stage_progress(:build, 1.0)
@@ -300,6 +302,7 @@ module PointCloudPlugin
         end
 
         write_preview_sample(preview_accumulator)
+        build_preview_construction_points(load_cached_preview_samples)
 
         transition_state(:build)
         update_stage_progress(:build, 1.0)
@@ -489,6 +492,93 @@ module PointCloudPlugin
         data
       rescue StandardError
         nil
+      end
+
+      def build_preview_construction_points(raw_samples)
+        return if cancelled?
+        return if cloud_id.nil?
+
+        samples = Array(raw_samples)
+        return if samples.empty?
+        return unless queue.respond_to?(:push_sync)
+
+        queue.push_sync do
+          begin
+            builder = PointCloudPlugin::UI::CPointsBuilder.new
+            builder.build(cloud_id: cloud_id, samples: samples)
+            apply_preview_visibility_settings
+          rescue StandardError => e
+            warn("Failed to build preview construction points: #{e.message}")
+          end
+        end
+      rescue StandardError => e
+        warn("Failed to dispatch preview construction points: #{e.message}")
+      end
+
+      def apply_preview_visibility_settings
+        return unless defined?(PointCloudPlugin)
+
+        tool = PointCloudPlugin.respond_to?(:tool) ? PointCloudPlugin.tool : nil
+        settings_dialog = tool&.settings_dialog
+        settings = settings_dialog&.settings || {}
+
+        show_points = settings.key?(:preview_show_points) ? !!settings[:preview_show_points] : false
+        anchor_only = show_points && settings.key?(:preview_anchor_only) ? !!settings[:preview_anchor_only] : false
+
+        if PointCloudPlugin.respond_to?(:update_preview_visibility)
+          PointCloudPlugin.update_preview_visibility(
+            show_points: show_points,
+            anchor_only: anchor_only
+          )
+        end
+
+        if settings_dialog && settings_dialog.respond_to?(:update_preview_controls)
+          settings_dialog.update_preview_controls(
+            available: true,
+            show_points: show_points,
+            anchors_only: anchor_only
+          )
+        end
+      rescue StandardError => e
+        warn("Failed to apply preview visibility settings: #{e.message}")
+      end
+
+      def load_cached_preview_samples
+        store = pipeline&.chunk_store
+        cache_path = store&.cache_path
+        return [] unless cache_path
+
+        path = File.join(cache_path, SAMPLE_FILE_NAME)
+        return [] unless File.file?(path)
+
+        data = File.binread(path)
+        return [] unless data && data.bytesize >= 14
+
+        header = data[0, 14].unpack('a4 S< L< L<')
+        magic, version, count, flags = header
+        return [] unless magic == SAMPLE_MAGIC && version == SAMPLE_VERSION
+
+        has_color = (flags & SAMPLE_FLAG_HAS_COLOR).positive?
+        offset = 14
+        record_size = 12 + (has_color ? 3 : 0) + 1
+        samples = []
+
+        count.times do
+          break if offset + record_size > data.bytesize
+
+          coords = data[offset, 12].unpack('e3')
+          offset += 12
+          offset += 3 if has_color
+          anchor_flag = data.getbyte(offset) || 0
+          offset += 1
+
+          samples << { position: coords, anchor: anchor_flag.positive? }
+        end
+
+        samples
+      rescue StandardError => e
+        warn("Failed to load cached preview samples: #{e.message}")
+        []
       end
 
       def flush_pending_view_invalidation

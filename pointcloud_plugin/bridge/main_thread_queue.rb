@@ -20,6 +20,41 @@ module PointCloudPlugin
         start_timer
       end
 
+      def push_sync(&block)
+        return unless block
+
+        if Thread.current == Thread.main || !timer_available?
+          block.call
+          return
+        end
+
+        mutex = Mutex.new
+        condition = ConditionVariable.new
+        error = nil
+        completed = false
+
+        wrapped = proc do
+          begin
+            block.call
+          rescue StandardError => e
+            error = e
+          ensure
+            mutex.synchronize do
+              completed = true
+              condition.broadcast
+            end
+          end
+        end
+
+        push(&wrapped)
+
+        mutex.synchronize do
+          condition.wait(mutex) until completed
+        end
+
+        raise error if error
+      end
+
       def drain
         backlog = @queue.size
         if backlog > QUEUE_WARNING_THRESHOLD && PointCloudPlugin.respond_to?(:log)
@@ -49,6 +84,10 @@ module PointCloudPlugin
             drain
           end
         end
+      end
+
+      def timer_available?
+        defined?(UI) && UI.respond_to?(:start_timer)
       end
     end
   end
