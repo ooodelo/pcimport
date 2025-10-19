@@ -4,11 +4,13 @@ require 'set'
 
 require_relative '../bridge/point_cloud_manager'
 require_relative '../core/lod/pipeline'
+require_relative '../core/project_cache_manager'
 require_relative '../core/spatial/knn'
 require_relative '../core/spatial/frustum'
 require_relative 'hud'
 require_relative 'dialog_settings'
 require_relative 'import_overlay'
+require_relative 'dialog_progress'
 require_relative 'visibility' rescue nil
 require_relative 'preview_layer' rescue nil
 
@@ -42,7 +44,11 @@ module PointCloudPlugin
         @hud = Hud.new
         @settings_dialog = DialogSettings.new
         @settings = @settings_dialog.settings
-        @import_overlay = ImportOverlay.new
+        @import_overlay = DialogProgress.new(
+          manager: manager,
+          cache_loader: -> { load_cached_clouds },
+          settings: @settings
+        )
         @active_chunks = {}
         @chunk_usage = []
         @snap_target = nil
@@ -57,13 +63,12 @@ module PointCloudPlugin
         @camera_focused = false
         @memory_notice_expires_at = nil
         hook_settings
-        if @settings_dialog.respond_to?(:update_preview_controls)
-          @settings_dialog.update_preview_controls(
-            available: false,
-            show_points: @settings[:preview_show_points],
-            anchors_only: @settings[:preview_anchor_only]
-          )
-        end
+        setup_progress_dialog_bridge
+        update_preview_controls_ui(
+          false,
+          show_points: @settings[:preview_show_points],
+          anchors_only: @settings[:preview_anchor_only]
+        )
       end
 
       def activate
@@ -120,7 +125,9 @@ module PointCloudPlugin
           handle_visualization_ready(points_drawn)
           PointCloud::UI::PreviewLayer.draw(view, self) if defined?(PointCloud::UI::PreviewLayer)
           hud.draw(view)
-          import_overlay.draw(view) if import_overlay
+          if import_overlay && import_overlay.respond_to?(:draw) && import_overlay.using_fallback?
+            import_overlay.draw(view)
+          end
         end
       end
 
@@ -185,13 +192,12 @@ module PointCloudPlugin
         update_import_state(:initializing)
         hud.update(load_status: "Загрузка: инициализация", memory_notice: nil)
         hud.update(points_on_screen: 0)
-        if settings_dialog.respond_to?(:update_preview_controls)
-          settings_dialog.update_preview_controls(
-            available: false,
-            show_points: @settings[:preview_show_points],
-            anchors_only: @settings[:preview_anchor_only]
-          )
-        end
+        update_preview_controls_ui(
+          false,
+          show_points: @settings[:preview_show_points],
+          anchors_only: @settings[:preview_anchor_only]
+        )
+        refresh_progress_dialog_clouds
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
           PointCloudPlugin.invalidate_active_view
         end
@@ -220,6 +226,13 @@ module PointCloudPlugin
 
         if info.is_a?(Hash) && info[:preview_ready]
           @preview_ready = true
+          update_preview_controls_ui(
+            true,
+            show_points: @settings[:preview_show_points],
+            anchors_only: @settings[:preview_anchor_only]
+          )
+        elsif info.is_a?(Hash)
+          sync_preview_dialog_state
         end
 
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
@@ -265,6 +278,12 @@ module PointCloudPlugin
         @visualization_announced = false
         @memory_notice_expires_at = nil
         hud.update(memory_notice: nil)
+        update_preview_controls_ui(
+          false,
+          show_points: @settings[:preview_show_points],
+          anchors_only: @settings[:preview_anchor_only]
+        )
+        refresh_progress_dialog_clouds
         import_overlay.hide!
         if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
           PointCloudPlugin.invalidate_active_view
@@ -294,6 +313,98 @@ module PointCloudPlugin
 
       private
 
+      def setup_progress_dialog_bridge
+        return unless import_overlay
+
+        if import_overlay.respond_to?(:on_cancel)
+          import_overlay.on_cancel do
+            cancel_active_import
+          end
+        end
+
+        if import_overlay.respond_to?(:on_visibility_change)
+          import_overlay.on_visibility_change do |state|
+            handle_preview_visibility_change(
+              show_points: state[:points],
+              anchors_only: state[:anchors]
+            )
+          end
+        end
+
+        import_overlay.update_settings(@settings) if import_overlay.respond_to?(:update_settings)
+        refresh_progress_dialog_clouds
+      end
+
+      def update_preview_controls_ui(available, show_points:, anchors_only:)
+        show_points = !!show_points
+        anchors_only = show_points && !!anchors_only
+
+        if settings_dialog.respond_to?(:update_preview_controls)
+          settings_dialog.update_preview_controls(
+            available: available,
+            show_points: show_points,
+            anchors_only: anchors_only
+          )
+        end
+
+        if import_overlay.respond_to?(:update_preview_state)
+          import_overlay.update_preview_state(
+            available: available,
+            show_points: show_points,
+            show_anchors: anchors_only
+          )
+        end
+      end
+
+      def sync_preview_dialog_state
+        return unless import_overlay.respond_to?(:update_preview_state)
+
+        show_points = !!@settings[:preview_show_points]
+        anchors_only = show_points && !!@settings[:preview_anchor_only]
+        import_overlay.update_preview_state(
+          available: @preview_ready,
+          show_points: show_points,
+          show_anchors: anchors_only
+        )
+      end
+
+      def handle_preview_visibility_change(show_points:, anchors_only:)
+        points_enabled = !!show_points
+        anchors_enabled = points_enabled && !!anchors_only
+
+        if @settings
+          @settings[:preview_show_points] = points_enabled
+          @settings[:preview_anchor_only] = anchors_enabled
+        end
+
+        update_preview_controls_ui(@preview_ready, show_points: points_enabled, anchors_only: anchors_enabled)
+
+        if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:update_preview_visibility)
+          PointCloudPlugin.update_preview_visibility(
+            show_points: points_enabled,
+            anchor_only: anchors_enabled
+          )
+        end
+      end
+
+      def refresh_progress_dialog_clouds
+        import_overlay.refresh_cached_clouds if import_overlay.respond_to?(:refresh_cached_clouds)
+      end
+
+      def load_cached_clouds
+        manager = instantiate_project_cache_manager
+        manager ? manager.clouds : {}
+      end
+
+      def instantiate_project_cache_manager
+        model = if defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+                  Sketchup.active_model
+                end
+        Core::ProjectCacheManager.new(model)
+      rescue StandardError
+        nil
+      end
+
       PREVIEW_BUFFER_LIMIT = 2_000
 
       def preview_buffer_samples(limit)
@@ -310,6 +421,9 @@ module PointCloudPlugin
 
         import_overlay.show!
         import_overlay.update_state(new_state)
+        if import_overlay.respond_to?(:set_manager_visibility) && new_state && !%i[navigating cancelled].include?(new_state)
+          import_overlay.set_manager_visibility(false)
+        end
         import_overlay.update_stage_progress(stage_progress) if stage_progress
 
         label = case new_state
@@ -429,6 +543,8 @@ module PointCloudPlugin
         return unless current_settings
 
         update_hud_runtime_metrics(current_settings)
+        import_overlay.update_settings(current_settings) if import_overlay.respond_to?(:update_settings)
+        sync_preview_dialog_state
       end
 
       def update_hud_runtime_metrics(settings)
