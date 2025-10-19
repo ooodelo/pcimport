@@ -35,14 +35,20 @@ module PointCloudPlugin
         intensities&.compact&.any?
       end
 
-      def byte_size
-        per_point = 6
-        per_point += 3 if has_rgb?
-        per_point += 2 if has_intensity?
-        header = 64
+      HEADER_BYTES = 64
+      COORDINATE_BYTES = 2
+      COLOR_CHANNEL_BYTES = 1
+      INTENSITY_BYTES = 2
 
-        header + per_point * count
+      def memory_bytes
+        per_point = 3 * COORDINATE_BYTES
+        per_point += 3 * COLOR_CHANNEL_BYTES if has_rgb?
+        per_point += INTENSITY_BYTES if has_intensity?
+
+        HEADER_BYTES + per_point * count
       end
+
+      alias byte_size memory_bytes
 
       def each_point
         return enum_for(:each_point) unless block_given?
