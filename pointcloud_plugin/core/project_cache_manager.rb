@@ -37,17 +37,19 @@ module PointCloudPlugin
       def project_path
         return @project_path if defined?(@project_path)
 
-        @project_path = begin
-          next unless model
-          next unless model.respond_to?(:path)
+        return cache_project_path(nil) unless model&.respond_to?(:path)
 
-          raw = model.path
-          raw = raw.to_s
-          raw = nil if raw.empty?
-          raw && File.expand_path(raw)
-        rescue StandardError
-          nil
-        end
+        raw = model.path
+        raw = raw.to_s
+        raw = nil if raw.empty?
+
+        cache_project_path(raw && File.expand_path(raw))
+      rescue StandardError
+        cache_project_path(nil)
+      end
+
+      def cache_project_path(value)
+        @project_path = value
       end
 
       # Computes the cache root for the project and ensures the directory
