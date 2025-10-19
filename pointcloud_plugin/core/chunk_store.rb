@@ -8,7 +8,7 @@ module PointCloudPlugin
     class ChunkStore
       Entry = Struct.new(:key, :chunk, :bytes)
 
-      attr_reader :cache_path, :max_in_memory
+      attr_reader :cache_path, :max_in_memory, :memory_limit_bytes
 
       DEFAULT_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
@@ -20,6 +20,8 @@ module PointCloudPlugin
         @on_remove_callbacks = []
         @bytes_in_ram = 0
         @memory_limit_bytes = normalize_memory_limit(memory_limit_mb)
+        @memory_pressure_callbacks = []
+        @memory_pressure_notified = false
         FileUtils.mkdir_p(cache_path)
       end
 
@@ -89,8 +91,15 @@ module PointCloudPlugin
         @on_remove_callbacks << block
       end
 
+      def on_memory_pressure(&block)
+        return unless block
+
+        @memory_pressure_callbacks << block
+      end
+
       def memory_limit_mb=(mb)
         @memory_limit_bytes = normalize_memory_limit(mb)
+        @memory_pressure_notified = false
         evict_until_limit
       end
 
@@ -117,18 +126,32 @@ module PointCloudPlugin
       end
 
       def evict_until_limit
+        freed_bytes = 0
         while @bytes_in_ram > @memory_limit_bytes && @lru.any?
           key = @lru.pop
           entry = @entries.delete(key)
           next unless entry
 
           @bytes_in_ram -= entry.bytes
+          freed_bytes += entry.bytes
           notify_removed(key)
         end
+
+        notify_memory_pressure(freed_bytes) if freed_bytes.positive?
       end
 
       def notify_removed(key)
         @on_remove_callbacks.each { |callback| callback.call(key) }
+      end
+
+      def notify_memory_pressure(freed_bytes)
+        return if @memory_pressure_notified
+        return if @memory_pressure_callbacks.empty?
+
+        @memory_pressure_notified = true
+        @memory_pressure_callbacks.each do |callback|
+          callback.call(freed_bytes, @memory_limit_bytes)
+        end
       end
     end
   end

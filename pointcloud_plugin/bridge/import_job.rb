@@ -10,7 +10,8 @@ module PointCloudPlugin
   module Bridge
     # Handles background import of point cloud files and forwards chunks to the core pipeline.
     class ImportJob
-      attr_reader :path, :reader, :pipeline, :queue, :progress
+      attr_reader :path, :reader, :pipeline, :queue, :progress, :state, :completion_status, :stage_progress
+      attr_accessor :cloud_id
 
       def initialize(path:, reader:, pipeline:, queue: MainThreadQueue.new)
         @path = path
@@ -21,6 +22,10 @@ module PointCloudPlugin
         @chunk_index = 0
         @thread = nil
         @preview_ready = false
+        @state = :initializing
+        @completion_status = :pending
+        @stage_progress = { reading: 0.0, preparing: 0.0, visualizing: 0.0 }
+        @cancelled = false
       end
 
       def start(&block)
@@ -32,56 +37,70 @@ module PointCloudPlugin
         @thread&.join
       end
 
+      def cancel
+        @cancelled = true
+      end
+
+      def cancelled?
+        @cancelled
+      end
+
       private
 
       def run
         total_points = 0
         size_in_bytes = file_size_bytes
         estimated_total = estimate_total_points(size_in_bytes)
-        first_chunk_shown = false
         @start_time = monotonic_time
         @last_log_time = @start_time
         @last_logged_percent = 0.0
 
         log_start(size_in_bytes, estimated_total)
+        transition_state(:reading)
 
         reader.each_batch do |batch|
-          total_points += batch.size
+          break if cancelled?
+
+          preview_points = preview_sample(batch)
+          batch_points = batch.respond_to?(:size) ? batch.size : Array(batch).size
+          total_points += batch_points
+          ratio = progress_ratio(total_points, estimated_total)
+          update_stage_progress(:reading, ratio)
+
           chunk = pack(batch)
           first_chunk = (@chunk_index.zero?)
+          transition_state(:preparing) if first_chunk
+          update_stage_progress(:preparing, ratio)
+
+          break if cancelled?
+
           key = next_key
           pipeline.submit_chunk(key, chunk)
           preview_became_ready = mark_preview_ready(first_chunk)
+          transition_state(:visualizing) if preview_became_ready
+          update_stage_progress(:visualizing, ratio) if preview_ready?
+
           @progress = total_points
 
-          progress_percent = if estimated_total && estimated_total.positive?
-                               [((total_points.to_f / estimated_total) * 100.0), 100.0].min
-                             end
-
+          progress_percent = ratio.positive? ? (ratio * 100.0) : nil
           elapsed = elapsed_time
           bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
           log_progress(total_points, estimated_total, progress_percent, elapsed, bytes_processed)
 
           queue.push do
-            notify_progress(
-              key,
-              chunk,
+            info = {
               total_points: total_points,
               estimated_total: estimated_total,
               progress_percent: progress_percent,
               first_chunk: first_chunk,
-              preview_ready: preview_ready?
-            )
+              preview_ready: preview_ready?,
+              stage: state,
+              stage_progress: @stage_progress.dup,
+              preview_points: preview_points
+            }
 
-            unless first_chunk_shown
-              first_chunk_shown = true if first_chunk
-              if first_chunk && defined?(PointCloudPlugin)
-                PointCloudPlugin.activate_tool if PointCloudPlugin.respond_to?(:activate_tool)
-                if PointCloudPlugin.respond_to?(:focus_camera_on_chunk)
-                  PointCloudPlugin.focus_camera_on_chunk(chunk)
-                end
-              end
-            end
+            notify_progress(key, chunk, **info)
+            dispatch_to_tool(key, chunk, info)
 
             update_hud_progress(
               total_points,
@@ -96,8 +115,16 @@ module PointCloudPlugin
           end
         end
 
+        if cancelled?
+          handle_cancellation(total_points, estimated_total, size_in_bytes)
+          return
+        end
+
         elapsed = elapsed_time
+        @completion_status = :completed
+        finalize_stage_completion
         log_completion(total_points, elapsed, size_in_bytes)
+        transition_state(:navigating)
 
         queue.push do
           update_hud_progress(
@@ -110,16 +137,10 @@ module PointCloudPlugin
           @on_complete&.call(self)
         end
       rescue StandardError => e
-        warn("Import failed: #{e.class}: #{e.message}\n#{e.backtrace.join("\n")}")
-        queue.push do
-          update_hud_failure(e)
-          if defined?(UI) && UI.respond_to?(:messagebox)
-            UI.messagebox("Point cloud import failed: #{e.message}")
-          end
-        end
+        handle_failure(e)
       end
 
-      def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false, preview_ready: false)
+      def notify_progress(key, chunk, total_points: nil, estimated_total: nil, progress_percent: nil, first_chunk: false, preview_ready: false, stage: nil, stage_progress: nil, preview_points: nil)
         # Hook for UI updates; by default does nothing but can be extended.
         if respond_to?(:on_chunk)
           begin
@@ -130,7 +151,10 @@ module PointCloudPlugin
               estimated_total: estimated_total,
               progress_percent: progress_percent,
               first_chunk: first_chunk,
-              preview_ready: preview_ready
+              preview_ready: preview_ready,
+              stage: stage,
+              stage_progress: stage_progress,
+              preview_points: preview_points
             )
           rescue ArgumentError
             on_chunk(key, chunk)
@@ -390,6 +414,101 @@ module PointCloudPlugin
         view.invalidate
       rescue StandardError => e
         warn("Failed to invalidate active view: #{e.class}: #{e.message}")
+      end
+
+      PREVIEW_SAMPLE_LIMIT = 512
+
+      def preview_sample(batch)
+        return [] if preview_ready?
+
+        array = Array(batch)
+        return [] if array.empty?
+
+        array.first([array.length, PREVIEW_SAMPLE_LIMIT].min).map do |point|
+          point.is_a?(Hash) ? point.dup : point
+        end
+      rescue StandardError
+        []
+      end
+
+      def transition_state(new_state)
+        new_state = new_state.to_sym
+        return if @state == new_state
+
+        @state = new_state
+        queue.push { dispatch_state_change(new_state) }
+      end
+
+      def dispatch_state_change(new_state)
+        tool = active_tool
+        return unless tool && tool.respond_to?(:handle_import_state)
+
+        tool.handle_import_state(job: self, state: new_state, stage_progress: @stage_progress.dup)
+      end
+
+      def dispatch_to_tool(key, chunk, info)
+        tool = active_tool
+        return unless tool
+
+        PointCloudPlugin.activate_tool if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:activate_tool)
+
+        if tool.respond_to?(:handle_import_state)
+          tool.handle_import_state(job: self, state: info[:stage] || state, stage_progress: info[:stage_progress])
+        end
+
+        if tool.respond_to?(:handle_import_chunk)
+          tool.handle_import_chunk(job: self, key: key, chunk: chunk, info: info)
+        end
+      end
+
+      def active_tool
+        return unless defined?(PointCloudPlugin)
+        return unless PointCloudPlugin.respond_to?(:tool)
+
+        PointCloudPlugin.tool
+      end
+
+      def update_stage_progress(stage, ratio)
+        return unless @stage_progress.key?(stage)
+
+        @stage_progress[stage] = ratio.clamp(0.0, 1.0)
+      end
+
+      def progress_ratio(total_points, estimated_total)
+        return 0.0 unless estimated_total && estimated_total.positive?
+
+        [total_points.to_f / estimated_total, 1.0].min
+      end
+
+      def finalize_stage_completion
+        @stage_progress.keys.each { |key| @stage_progress[key] = 1.0 }
+        transition_state(:visualizing) unless @state == :visualizing || @state == :navigating
+      end
+
+      def handle_cancellation(total_points, estimated_total, size_in_bytes)
+        @completion_status = :cancelled
+        transition_state(:cancelled)
+        pipeline.chunk_store.flush! if pipeline.respond_to?(:chunk_store)
+        elapsed = elapsed_time
+        bytes_processed = processed_bytes(total_points, estimated_total, size_in_bytes)
+
+        queue.push do
+          update_hud_progress(total_points, estimated_total, nil, elapsed: elapsed, bytes_processed: bytes_processed)
+          @on_complete&.call(self)
+        end
+      end
+
+      def handle_failure(error)
+        warn("Import failed: #{error.class}: #{error.message}\n#{Array(error.backtrace).join("\n")}")
+        @completion_status = :failed
+        transition_state(:cancelled)
+        queue.push do
+          update_hud_failure(error)
+          if defined?(UI) && UI.respond_to?(:messagebox)
+            UI.messagebox("Point cloud import failed: #{error.message}")
+          end
+          @on_complete&.call(self)
+        end
       end
     end
   end

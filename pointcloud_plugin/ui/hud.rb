@@ -31,7 +31,7 @@ module PointCloudPlugin
 
       private
 
-      PRIORITY_KEYS = %w[fps load_status load_speed points_on_screen].freeze
+      PRIORITY_KEYS = %w[fps load_status load_speed points_on_screen memory_notice].freeze
 
       def format_metrics
         PRIORITY_KEYS.filter_map do |key|

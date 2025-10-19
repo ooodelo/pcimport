@@ -35,6 +35,24 @@ module PointCloudPlugin
 
         assert_equal ['second'], keys_in_memory
       end
+
+      def test_notifies_on_memory_pressure_once
+        store = ChunkStore.new(cache_path: @cache_dir, memory_limit_mb: 1)
+        notifications = []
+
+        store.on_memory_pressure do |freed_bytes, limit_bytes|
+          notifications << [freed_bytes, limit_bytes]
+        end
+
+        store.store('first', FakeChunk.new(800_000))
+        store.store('second', FakeChunk.new(800_000))
+        store.store('third', FakeChunk.new(400_000))
+
+        assert_equal 1, notifications.length
+        freed_bytes, limit_bytes = notifications.first
+        assert_in_delta 800_000, freed_bytes, 1_000
+        assert_equal store.memory_limit_bytes, limit_bytes
+      end
     end
   end
 end
