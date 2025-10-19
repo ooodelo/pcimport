@@ -1,0 +1,17 @@
+AllCops:
+  NewCops: enable
+  Exclude:
+    - 'reports/**/*'
+    - 'tmp/**/*'
+    - 'vendor/**/*'
+  TargetRubyVersion: 3.1
+
+Layout/LineLength:
+  Max: 120
+
+Metrics/BlockLength:
+  Exclude:
+    - 'pointcloud_plugin/test/**/*'
+
+Metrics/MethodLength:
+  Max: 25
