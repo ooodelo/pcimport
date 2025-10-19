@@ -87,6 +87,8 @@ module PointCloudPlugin
               elapsed: elapsed,
               bytes_processed: bytes_processed
             )
+
+            MainThreadQueue.post { Sketchup.active_model.active_view.invalidate }
           end
         end
 
