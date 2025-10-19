@@ -12,10 +12,12 @@ module PointCloudPlugin
         PREDICTION_HORIZON = 0.5
         MIN_MOVEMENT_LENGTH = 1e-3
 
-        def initialize(chunk_store)
+        def initialize(chunk_store, index_builder: nil)
           @chunk_store = chunk_store
-          @index_builder = Spatial::IndexBuilder.new(chunk_store)
+          @index_builder = index_builder || Spatial::IndexBuilder.new(chunk_store)
           @camera_history = []
+          @known_chunks = {}
+          @index_dirty = true
         end
 
         def prefetch_for_view(frustum, budget: 8, camera_position: nil, timestamp: nil)
@@ -31,7 +33,7 @@ module PointCloudPlugin
 
           frustum = extend_frustum(frustum, movement_vector)
 
-          root = @index_builder.build
+          root = ensure_index_up_to_date
           return unless root
 
           nodes = if frustum
@@ -105,6 +107,37 @@ module PointCloudPlugin
           Process.clock_gettime(Process::CLOCK_MONOTONIC)
         rescue StandardError
           Time.now.to_f
+        end
+
+        def ensure_index_up_to_date
+          entries = current_entries
+
+          removed_keys = @known_chunks.keys - entries.keys
+          replaced_keys = entries.select { |key, chunk| @known_chunks.key?(key) && @known_chunks[key] != chunk.object_id }.keys
+          new_keys = entries.keys - @known_chunks.keys
+
+          if @index_dirty || removed_keys.any? || replaced_keys.any?
+            root = @index_builder.build
+            @known_chunks = entries.transform_values(&:object_id)
+            @index_dirty = false
+            return root
+          end
+
+          new_keys.each do |key|
+            chunk = entries[key]
+            next unless chunk
+
+            @index_builder.add_chunk(key, chunk)
+            @known_chunks[key] = chunk.object_id
+          end
+
+          @index_builder.root
+        end
+
+        def current_entries
+          @chunk_store.each_in_memory.each_with_object({}) do |(key, chunk), hash|
+            hash[key] = chunk
+          end
         end
       end
     end
