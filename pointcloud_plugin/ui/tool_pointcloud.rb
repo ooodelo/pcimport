@@ -269,16 +269,24 @@ module PointCloudPlugin
         budget = @settings[:budget].to_i
         points_accumulated = 0
 
+        visible_entries_by_cloud = manager.each_cloud.each_with_object({}) do |cloud, hash|
+          hash[cloud.id] = visible_chunk_entries_for(cloud, frustum, view)
+        end
+
         manager.each_cloud do |cloud|
+          visible_entries = Array(visible_entries_by_cloud[cloud.id]).compact
+          visible_chunk_keys = visible_entries.map { |entry| entry[:key] }.compact
+
           cloud.prefetcher.prefetch_for_view(
-            frustum,
+            visible_entries,
             budget: @settings[:budget],
             camera_position: camera_position
           )
           cloud.pipeline.next_chunks(
             frame_budget: @settings[:budget],
             frustum: frustum,
-            camera_position: camera_position
+            camera_position: camera_position,
+            visible_chunk_keys: visible_chunk_keys
           ).each do |key, chunk|
             next unless chunk
 
@@ -356,7 +364,35 @@ module PointCloudPlugin
       SCREEN_MARGIN = 32
 
       def chunk_visible?(chunk, frustum, view)
-        bounds = chunk.metadata[:bounds]
+        metadata = chunk.respond_to?(:metadata) ? chunk.metadata : nil
+        bounds = metadata && (metadata[:bounds] || metadata['bounds'])
+        visible_bounds?(bounds, frustum, view)
+      end
+
+      def visible_chunk_entries_for(cloud, frustum, view)
+        nodes = cloud.pipeline.visible_nodes_for(frustum)
+        return [] unless nodes
+
+        entries = Array(nodes).flat_map do |node|
+          next [] unless node.respond_to?(:chunk_refs)
+
+          Array(node.chunk_refs).filter_map do |ref|
+            key = ref[:key] || ref['key']
+            next unless key
+
+            bounds = ref[:bounds] || ref['bounds']
+            next unless visible_bounds?(bounds, frustum, view)
+
+            { key: key, bounds: bounds }
+          end
+        end
+
+        entries.uniq { |entry| entry[:key] }
+      rescue StandardError
+        []
+      end
+
+      def visible_bounds?(bounds, frustum, view)
         return true unless bounds
 
         visible = screen_culling_visibility(view, bounds)

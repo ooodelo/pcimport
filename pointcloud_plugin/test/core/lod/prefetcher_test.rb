@@ -67,19 +67,19 @@ module PointCloudPlugin
           store_chunk('b', center: [2, 0, 0])
           store_chunk('c', center: [4, 0, 0])
 
-          @prefetcher.prefetch_for_view(nil)
+          @prefetcher.prefetch_for_view([])
 
           assert_equal 1, @index_builder.build_calls
 
           store_chunk('d', center: [1, 0, 0])
 
-          @prefetcher.prefetch_for_view(nil)
+          @prefetcher.prefetch_for_view([])
 
           assert_equal 1, @index_builder.build_calls
 
           @store.release('b')
 
-          @prefetcher.prefetch_for_view(nil)
+          @prefetcher.prefetch_for_view([])
 
           assert_equal 2, @index_builder.build_calls
         end

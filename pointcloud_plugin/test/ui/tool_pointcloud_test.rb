@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'minitest/autorun'
+require 'set'
 
 require_relative '../../ui/tool_pointcloud'
 
@@ -46,14 +47,14 @@ module PointCloudPlugin
       end
 
       class FakePrefetcher
-        attr_reader :frustums
+        attr_reader :visible_calls
 
         def initialize
-          @frustums = []
+          @visible_calls = []
         end
 
-        def prefetch_for_view(frustum, budget: 0, camera_position: nil)
-          @frustums << frustum
+        def prefetch_for_view(visible_chunks, budget: 0, camera_position: nil)
+          @visible_calls << visible_chunks
           @last_budget = budget
           @last_camera_position = camera_position
         end
@@ -69,10 +70,25 @@ module PointCloudPlugin
           @chunks = chunks
           @chunk_store = Object.new
           @reservoir = reservoir || EmptyReservoir.new
+          refs = chunks.map do |key, chunk|
+            {
+              key: key,
+              bounds: chunk.respond_to?(:metadata) ? chunk.metadata[:bounds] : nil,
+              point_count: chunk.respond_to?(:size) ? chunk.size : 0
+            }
+          end
+          @visible_nodes = [Node.new(refs)]
         end
 
-        def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil)
-          @chunks
+        def next_chunks(frame_budget: 0, frustum: nil, camera_position: nil, visible_chunk_keys: nil, **_ignored)
+          return @chunks if visible_chunk_keys.nil? || visible_chunk_keys.empty?
+
+          keys = visible_chunk_keys.to_set
+          @chunks.select { |key, _| keys.include?(key) }
+        end
+
+        def visible_nodes_for(_frustum)
+          @visible_nodes
         end
 
         class EmptyReservoir
@@ -80,6 +96,8 @@ module PointCloudPlugin
             []
           end
         end
+
+        Node = Struct.new(:chunk_refs)
       end
 
       class FakeCamera
@@ -148,8 +166,8 @@ module PointCloudPlugin
         tool.send(:gather_chunks, view)
 
         assert_empty tool.instance_variable_get(:@active_chunks)
-        assert_equal 1, prefetcher.frustums.size
-        assert_equal 6, prefetcher.frustums.first.planes.size
+        assert_equal 1, prefetcher.visible_calls.size
+        assert_empty prefetcher.visible_calls.first
       end
 
       def test_visible_chunk_is_rendered
@@ -167,6 +185,7 @@ module PointCloudPlugin
 
         refute_empty tool.instance_variable_get(:@active_chunks)
         assert_equal visible_chunk, tool.instance_variable_get(:@active_chunks)['chunk'][:chunk]
+        assert_equal [{ key: 'chunk', bounds: visible_chunk.metadata[:bounds] }], prefetcher.visible_calls.first
       end
 
       def test_update_snap_target_uses_reservoir_samples
