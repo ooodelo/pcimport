@@ -17,10 +17,13 @@ module PointCloudPlugin
         @queue = MainThreadQueue.new
       end
 
-      def register_cloud(name:, pipeline:, job: nil)
-        id = next_id
+      def register_cloud(name:, pipeline:, job: nil, id: nil)
+        id = normalize_identifier(id)
+        validate_unique_id!(id)
+        id ||= next_id
         prefetcher = Core::Lod::Prefetcher.new(pipeline.chunk_store)
         clouds[id] = Cloud.new(id, name, pipeline, prefetcher, job)
+        update_last_id_tracker(id)
         id
       end
 
@@ -44,6 +47,24 @@ module PointCloudPlugin
       def next_id
         (@last_id ||= 0)
         @last_id += 1
+      end
+
+      def normalize_identifier(identifier)
+        return identifier if identifier.nil?
+
+        identifier.is_a?(String) || identifier.is_a?(Integer) ? identifier : identifier.to_s
+      end
+
+      def validate_unique_id!(identifier)
+        return unless identifier
+
+        raise ArgumentError, "Cloud identifier '#{identifier}' already registered" if clouds.key?(identifier)
+      end
+
+      def update_last_id_tracker(identifier)
+        return unless identifier.is_a?(Integer)
+
+        @last_id = identifier if !@last_id || identifier > @last_id
       end
     end
   end

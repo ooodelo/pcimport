@@ -31,6 +31,8 @@ PointCloudPlugin.log('Loading runtime (pointcloud_plugin/main.rb)') if defined?(
 require_relative 'core/units'
 require_relative 'core/chunk'
 require_relative 'core/chunk_store'
+require_relative 'core/manifest'
+require_relative 'core/project_cache_manager'
 require_relative 'core/readers/reader_base'
 require_relative 'core/readers/ply_reader'
 require_relative 'core/readers/xyz_reader'
@@ -166,20 +168,44 @@ module PointCloudPlugin
 
   def begin_import(path, options)
     options ||= {}
+    normalized_path = File.expand_path(path)
     unit = (options[:unit] || :meter).to_sym
     offset = options[:offset] || {}
-    reader = build_reader(path, unit: unit, offset: offset)
-    cache_root = File.join(Dir.tmpdir, 'pointcloud_cache')
-    FileUtils.mkdir_p(cache_root)
-    cache_path = File.join(cache_root, File.basename(path, '.*'))
+
+    model = if defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+              Sketchup.active_model
+            end
+    cache_manager = Core::ProjectCacheManager.new(model)
+    existing_cloud = cache_manager.find_cloud_for_source(normalized_path)
+    cache_id = existing_cloud ? existing_cloud['id'] : cache_manager.generate_cloud_identifier
+    cache_path = cache_manager.cache_path_for(cache_id)
+
+    manifest = Core::Manifest.load(cache_path)
+    if manifest && !manifest.valid_for?(normalized_path)
+      Core::Manifest.invalidate!(cache_path)
+      manifest = nil
+    end
+
+    reuse_cache = manifest&.valid_for?(normalized_path)
+    manifest ||= Core::Manifest.new(cache_path: cache_path)
+    manifest.project_path = cache_manager.project_path
+    manifest.update_source!(normalized_path) unless reuse_cache
+    manifest.ensure_chunk_inventory!
+    manifest.write!
+
     runtime_settings = tool.settings_dialog.settings || {}
     memory_limit = runtime_settings[:memory_limit]
     chunk_store = Core::ChunkStore.new(cache_path: cache_path, memory_limit_mb: memory_limit)
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
-    job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
+    job = nil
+
+    unless reuse_cache
+      reader = build_reader(normalized_path, unit: unit, offset: offset)
+      job = Bridge::ImportJob.new(path: normalized_path, reader: reader, pipeline: pipeline, queue: manager.queue)
+      job.cloud_id = cache_id if job.respond_to?(:cloud_id=)
+    end
 
     activate_tool
-    tool.hud.update(load_status: 'Загрузка: инициализация')
 
     chunk_store.on_memory_pressure do |freed_bytes, limit_bytes|
       manager.queue.push do
@@ -189,14 +215,9 @@ module PointCloudPlugin
       end
     end
 
-    cloud_name = File.basename(path)
-    id = manager.register_cloud(name: cloud_name, pipeline: pipeline, job: job)
-    job.cloud_id = id if job.respond_to?(:cloud_id=)
-
-    if tool.respond_to?(:begin_import_session)
-      tool.begin_import_session(job: job, cloud_id: id, cloud_name: cloud_name)
-    end
-    tool.hud.update("cloud_#{id}" => cloud_name)
+    cloud_name = File.basename(normalized_path)
+    id = manager.register_cloud(name: cloud_name, pipeline: pipeline, job: job, id: cache_id)
+    cache_manager.register_cloud(id: id, name: cloud_name, source_path: normalized_path, cache_path: cache_path, manifest: manifest)
 
     begin
       apply_runtime_settings(runtime_settings)
@@ -204,13 +225,26 @@ module PointCloudPlugin
       log("Failed to apply runtime settings: #{e.class}: #{e.message}")
     end
 
-    job.start do |completed_job|
-      if tool.respond_to?(:handle_import_completion)
-        tool.handle_import_completion(completed_job)
-      else
-        tool.hud.update(load_status: 'Import complete')
+    status_text = reuse_cache ? 'Кэш загружен' : 'Загрузка: инициализация'
+    tool.hud.update(load_status: status_text)
+
+    if job
+      if tool.respond_to?(:begin_import_session)
+        tool.begin_import_session(job: job, cloud_id: id, cloud_name: cloud_name)
       end
+
+      job.start do |completed_job|
+        if tool.respond_to?(:handle_import_completion)
+          tool.handle_import_completion(completed_job)
+        else
+          tool.hud.update(load_status: 'Import complete')
+        end
+      end
+    else
+      invalidate_active_view
     end
+
+    tool.hud.update("cloud_#{id}" => cloud_name)
   end
 
   def build_reader(path, unit: :meter, offset: nil)
