@@ -1,0 +1,5 @@
+---
+app_path: pointcloud_plugin
+output_files:
+  - reports/brakeman.html
+quiet: false

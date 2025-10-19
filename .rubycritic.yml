@@ -1,0 +1,7 @@
+paths:
+  - pointcloud_plugin
+minimum_score: 90
+format: html
+output_directory: reports/rubycritic
+mode: :ci
+no_browser: true
