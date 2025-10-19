@@ -88,7 +88,12 @@ module PointCloudPlugin
               bytes_processed: bytes_processed
             )
 
-            MainThreadQueue.post { Sketchup.active_model.active_view.invalidate }
+            if defined?(PointCloudPlugin) && PointCloudPlugin.respond_to?(:invalidate_active_view)
+              PointCloudPlugin.invalidate_active_view
+            elsif defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+              view = Sketchup.active_model&.active_view
+              view.invalidate if view && view.respond_to?(:invalidate)
+            end
           end
         end
 

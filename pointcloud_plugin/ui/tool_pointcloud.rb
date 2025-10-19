@@ -15,7 +15,7 @@ module PointCloudPlugin
   module UI
     # SketchUp tool responsible for rendering imported point clouds and handling snapping.
     class ToolPointCloud
-      attr_reader :manager, :hud, :settings_dialog
+      attr_reader :manager, :hud, :settings_dialog, :settings
 
       def initialize(manager)
         @manager = manager
@@ -28,6 +28,7 @@ module PointCloudPlugin
         @frame_times = []
         @last_draw_time = nil
         hook_settings
+        apply_settings(@settings)
       end
 
       def activate
@@ -94,8 +95,15 @@ module PointCloudPlugin
 
       def hook_settings
         settings_dialog.on_change do |new_settings|
-          @settings = new_settings
+          apply_settings(new_settings)
         end
+      end
+
+      def apply_settings(new_settings)
+        normalized = DialogSettings::DEFAULTS.merge(symbolize_keys(new_settings))
+        @settings = normalized
+        apply_memory_limit(normalized[:memory_limit])
+        invalidate_view
       end
 
       def update_fps
@@ -131,6 +139,11 @@ module PointCloudPlugin
       end
 
       def color_bucket_for(point)
+        if settings[:monochrome]
+          grayscale = extract_grayscale(point)
+          return [[:monochrome, grayscale], [grayscale, grayscale, grayscale]]
+        end
+
         color = point[:color]
 
         if color.is_a?(Array) && color.length >= 3
@@ -162,6 +175,17 @@ module PointCloudPlugin
         return default_color if key == :default || rgb_values.nil?
         r, g, b = rgb_values
         Sketchup::Color.new(r.to_i.clamp(0, 255), g.to_i.clamp(0, 255), b.to_i.clamp(0, 255))
+      end
+
+      def extract_grayscale(point)
+        if point.key?(:intensity) && !point[:intensity].nil?
+          quantize_intensity(point[:intensity])
+        elsif point[:color].is_a?(Array) && point[:color].length >= 3
+          components = point[:color].first(3).map { |component| quantize_color_component(component) }
+          (components.sum / components.length.to_f).round
+        else
+          128
+        end
       end
 
       def safe_point_size
@@ -399,6 +423,36 @@ module PointCloudPlugin
       def chunk_size_for(key)
         entry = @active_chunks[key]
         entry ? entry[:chunk].size : 0
+      end
+
+      def symbolize_keys(hash)
+        return {} unless hash.respond_to?(:each_pair)
+
+        hash.each_with_object({}) do |(key, value), memo|
+          memo[key.to_sym] = value
+        end
+      end
+
+      def apply_memory_limit(limit_mb)
+        return unless limit_mb
+
+        manager.each_cloud do |cloud|
+          chunk_store = cloud.pipeline&.chunk_store
+          next unless chunk_store && chunk_store.respond_to?(:memory_limit_mb=)
+
+          chunk_store.memory_limit_mb = limit_mb
+        end
+      end
+
+      def invalidate_view
+        return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+        view = Sketchup.active_model&.active_view
+        return unless view && view.respond_to?(:invalidate)
+
+        view.invalidate
+      rescue NoMethodError
+        nil
       end
     end
   end

@@ -119,8 +119,14 @@ module PointCloudPlugin
     FileUtils.mkdir_p(cache_root)
     cache_path = File.join(cache_root, File.basename(path, '.*'))
     chunk_store = Core::ChunkStore.new(cache_path: cache_path)
+    memory_limit = tool.settings[:memory_limit] if tool.respond_to?(:settings)
+    chunk_store.memory_limit_mb = memory_limit if memory_limit && chunk_store.respond_to?(:memory_limit_mb=)
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
     job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
+
+    activate_tool
+    tool.hud.update(load_status: 'Loading…')
+    invalidate_active_view
 
     job.instance_variable_set(:@preview_initialized, false)
     job.define_singleton_method(:on_chunk) do |key, chunk, info = {}|
@@ -133,13 +139,16 @@ module PointCloudPlugin
           @preview_initialized = true
         end
       end
+
+      PointCloudPlugin.invalidate_active_view
     end
 
     id = manager.register_cloud(name: File.basename(path), pipeline: pipeline, job: job)
     tool.hud.update("cloud_#{id}" => File.basename(path))
 
     job.start do
-      tool.hud.update(status: 'Import complete')
+      tool.hud.update(load_status: 'Import complete')
+      PointCloudPlugin.invalidate_active_view
     end
   end
 
@@ -185,6 +194,17 @@ module PointCloudPlugin
     true
   rescue NoMethodError
     false
+  end
+
+  def invalidate_active_view
+    return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+    view = Sketchup.active_model&.active_view
+    return unless view && view.respond_to?(:invalidate)
+
+    view.invalidate
+  rescue NoMethodError
+    nil
   end
 
 end

@@ -126,23 +126,8 @@ module PointCloudPlugin
         HTML
         dialog.set_html(html)
         dialog.add_action_callback('apply') do |_context, payload|
-          data = JSON.parse(payload)
-          if data.key?('budget')
-            @settings[:budget] = data['budget'].to_i.clamp(100_000, 10_000_000)
-          end
-          if data.key?('point_size')
-            @settings[:point_size] = data['point_size'].to_i.clamp(1, 9)
-          end
-          if data.key?('snap_radius')
-            @settings[:snap_radius] = data['snap_radius'].to_f.clamp(0.1, 1000.0)
-          end
-          if data.key?('memory_limit')
-            @settings[:memory_limit] = data['memory_limit'].to_i.clamp(128, 65_536)
-          end
-          if data.key?('monochrome')
-            @settings[:monochrome] = !!data['monochrome']
-          end
-          @on_change&.call(@settings)
+          updates = normalize_settings_payload(payload)
+          apply_settings_updates(updates)
         end
         dialog
       end
@@ -281,6 +266,114 @@ module PointCloudPlugin
       public :show_import_dialog, :import_options
 
       private
+
+      def normalize_settings_payload(payload)
+        raw = deserialize_payload(payload)
+        data = raw.is_a?(Hash) ? raw : {}
+        data.transform_keys!(&:to_sym)
+        data
+      end
+
+      def deserialize_payload(payload)
+        parsed = payload
+        if parsed.is_a?(String)
+          begin
+            parsed = JSON.parse(parsed)
+          rescue JSON::ParserError
+            parsed = parsed
+          end
+        end
+
+        if parsed.is_a?(Array)
+          first = parsed.first
+          return deserialize_payload(first) if parsed.length == 1
+          return parsed.map { |value| deserialize_payload(value) }
+        end
+
+        parsed
+      end
+
+      def apply_settings_updates(updates)
+        return unless updates.is_a?(Hash)
+
+        updated = @settings.dup
+
+        if updates.key?(:budget)
+          updated[:budget] = clamp_integer(updates[:budget], 100_000, 10_000_000, fallback: @settings[:budget])
+        end
+
+        if updates.key?(:point_size)
+          updated[:point_size] = clamp_integer(updates[:point_size], 1, 9, fallback: @settings[:point_size])
+        end
+
+        if updates.key?(:snap_radius)
+          updated[:snap_radius] = clamp_float(updates[:snap_radius], 0.1, 1000.0, fallback: @settings[:snap_radius])
+        end
+
+        if updates.key?(:memory_limit)
+          updated[:memory_limit] = clamp_integer(updates[:memory_limit], 128, 65_536, fallback: @settings[:memory_limit])
+        end
+
+        if updates.key?(:monochrome)
+          updated[:monochrome] = truthy?(updates[:monochrome])
+        end
+
+        @settings = DEFAULTS.merge(updated)
+        @on_change&.call(@settings.dup)
+      end
+
+      def clamp_integer(value, min, max, fallback: min)
+        numeric = numeric_value(value)
+        return fallback unless numeric
+
+        integer = numeric.to_i
+        integer = min if integer < min
+        integer = max if integer > max
+        integer
+      end
+
+      def clamp_float(value, min, max, fallback: min)
+        numeric = numeric_value(value)
+        return fallback unless numeric
+
+        float = numeric.to_f
+        float = min if float < min
+        float = max if float > max
+        float
+      end
+
+      def numeric_value(value)
+        candidate = extract_candidate(value)
+        return candidate if candidate.is_a?(Numeric)
+
+        if candidate.respond_to?(:to_s)
+          string = candidate.to_s.strip
+          return nil if string.empty?
+          return Integer(string, exception: false) || Float(string, exception: false)
+        end
+
+        nil
+      rescue ArgumentError
+        nil
+      end
+
+      def extract_candidate(value)
+        return value if !value.is_a?(Array)
+        return nil if value.empty?
+
+        extract_candidate(value.first)
+      end
+
+      def truthy?(value)
+        candidate = extract_candidate(value)
+        case candidate
+        when TrueClass then true
+        when FalseClass, NilClass then false
+        when Numeric then !candidate.zero?
+        else
+          candidate.to_s.strip.downcase == 'true'
+        end
+      end
     end
   end
 end
