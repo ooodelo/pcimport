@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
+require 'set'
+
 require_relative '../spatial/index_builder'
-require_relative '../spatial/frustum'
 
 module PointCloudPlugin
   module Core
@@ -10,7 +11,10 @@ module PointCloudPlugin
       class Prefetcher
         HISTORY_LIMIT = 5
         PREDICTION_HORIZON = 0.5
-        MIN_MOVEMENT_LENGTH = 1e-3
+        DEFAULT_PREFETCH_LIMIT = 32
+        ANGLE_WEIGHT = 10.0
+        DISTANCE_WEIGHT = 1.0
+        FORWARD_COSINE_THRESHOLD = 0.0
 
         def initialize(chunk_store, index_builder: nil)
           @chunk_store = chunk_store
@@ -21,12 +25,13 @@ module PointCloudPlugin
         end
 
         def prefetch_for_view(
-          frustum,
+          visible_chunks,
           budget: 8,
           camera_position: nil,
           camera_direction: nil,
           view: nil,
-          timestamp: nil
+          timestamp: nil,
+          max_prefetch: DEFAULT_PREFETCH_LIMIT
         )
           timestamp ||= current_time
           track_camera_movement(camera_position, timestamp) if camera_position
@@ -38,35 +43,35 @@ module PointCloudPlugin
               predicted_position.zip(last_position).map { |predicted, current| predicted - current }
             end
 
-          frustum = extend_frustum(frustum, movement_vector)
-
           camera_forward = normalized_vector(camera_direction) || normalized_vector(movement_vector)
           camera_reference_position = camera_position || predicted_position || last_position
 
           root = ensure_index_up_to_date
           return unless root
 
-          nodes = if frustum
-                    visible = @index_builder.visible_nodes(frustum)
-                    visible.empty? ? root.visible_nodes(nil) : visible
-                  else
-                    root.visible_nodes(nil)
-                  end
+          loaded_entries = current_entries
 
-          keys = prioritized_chunk_keys(
-            nodes,
-            budget,
+          candidates = build_prefetch_candidates(
+            root,
+            visible_chunks,
             camera_forward,
             camera_reference_position,
             view
           )
 
+          limit = effective_prefetch_limit(budget: budget, max_prefetch: max_prefetch)
+          capacity = available_prefetch_capacity(loaded_entries.length)
+          limit = [limit, capacity].compact.min
+          return if limit && limit <= 0
+
+          keys = ordered_prefetch_keys(candidates)
+          keys.reject! { |key| loaded_entries.key?(key) }
+          keys = keys.first(limit) if limit
+
           @chunk_store.prefetch(keys) if keys.any?
         end
 
         private
-
-        VISIBILITY_MARGIN = 0.1
 
         def track_camera_movement(position, timestamp)
           entry = { position: position.map(&:to_f), timestamp: timestamp.to_f }
@@ -97,25 +102,6 @@ module PointCloudPlugin
           last_position.zip(averaged_velocity).map do |position_component, velocity_component|
             position_component + velocity_component * horizon
           end
-        end
-
-        def extend_frustum(frustum, movement_vector)
-          return frustum unless significant_movement?(movement_vector)
-
-          extended_planes = frustum.planes.map do |plane|
-            normal = plane.normal
-            offset = dot_product(normal, movement_vector)
-            distance_adjustment = offset.positive? ? offset : 0.0
-            Spatial::Plane.new(normal.dup, plane.distance - distance_adjustment)
-          end
-
-          Spatial::Frustum.new(extended_planes, epsilon: frustum.epsilon)
-        end
-
-        def significant_movement?(movement_vector)
-          return false unless movement_vector
-
-          movement_vector.any? { |component| component.abs > MIN_MOVEMENT_LENGTH }
         end
 
         def dot_product(a, b)
@@ -153,46 +139,39 @@ module PointCloudPlugin
           @index_builder.root
         end
 
-        def prioritized_chunk_keys(nodes, budget, camera_forward, camera_position, view)
-          candidates = nodes.flat_map do |node|
-            node.chunk_refs.map do |reference|
-              build_prefetch_candidate(reference, camera_forward, camera_position, view)
-            end
+        def build_prefetch_candidates(root, visible_chunks, camera_forward, camera_position, view)
+          normalized_visible = normalize_visible_chunks(visible_chunks, root, view)
+          visible_keys = normalized_visible.map { |entry| entry[:key] }.compact.to_set
+
+          references = collect_chunk_references(root)
+
+          references.map do |reference|
+            key = reference[:key]
+            bounds = reference[:bounds]
+
+            near_visible = visible_keys.include?(key)
+            distance_vector = vector_to_bounds(bounds, camera_position)
+            distance = vector_length(distance_vector)
+            cosine = cosine_to_forward(camera_forward, distance_vector, distance)
+
+            next if !near_visible && !include_candidate?(cosine, camera_forward, camera_position)
+
+            distance_metric =
+              if distance.nil?
+                near_visible ? 0.0 : Float::INFINITY
+              else
+                distance
+              end
+
+            {
+              key: key,
+              bounds: bounds,
+              distance: distance_metric,
+              cosine: cosine,
+              near_visible: near_visible,
+              priority: priority_score(cosine, distance_metric, near_visible)
+            }
           end.compact
-
-          ordered_keys = candidates
-            .sort_by do |candidate|
-              [
-                candidate[:near_visible] ? 0 : 1,
-                -candidate[:cosine],
-                candidate[:distance]
-              ]
-            end
-            .map { |candidate| candidate[:key] }
-            .uniq
-
-          return [] if budget && budget <= 0
-          return ordered_keys unless budget && budget.positive?
-
-          ordered_keys.first(budget)
-        end
-
-        def build_prefetch_candidate(reference, camera_forward, camera_position, view)
-          key = reference[:key]
-          bounds = reference[:bounds]
-
-          distance_vector = vector_to_bounds(bounds, camera_position)
-          distance = vector_length(distance_vector)
-          cosine = cosine_to_forward(camera_forward, distance_vector, distance)
-
-          near_visible = near_visible_chunk?(bounds, view)
-
-          {
-            key: key,
-            cosine: cosine,
-            distance: distance || Float::INFINITY,
-            near_visible: near_visible
-          }
         end
 
         def vector_to_bounds(bounds, camera_position)
@@ -229,31 +208,114 @@ module PointCloudPlugin
           vector.map { |component| component / length }
         end
 
-        def near_visible_chunk?(bounds, view)
-          return false unless bounds
-          return false unless defined?(PointCloud::UI::Visibility)
-
-          visibility = PointCloud::UI::Visibility
-          return false unless visibility.respond_to?(:chunk_visible?)
-
-          view ||= visibility.respond_to?(:current_view) ? visibility.current_view : nil
-          return false unless view
-
-          margin = visibility.respond_to?(:prefetch_margin) ? visibility.prefetch_margin : VISIBILITY_MARGIN
-
-          begin
-            visibility.chunk_visible?(view, bounds, margin: margin)
-          rescue ArgumentError
-            visibility.chunk_visible?(view, bounds)
-          rescue StandardError
-            false
-          end
-        end
-
         def current_entries
           @chunk_store.each_in_memory.each_with_object({}) do |(key, chunk), hash|
             hash[key] = chunk
           end
+        end
+
+        def collect_chunk_references(root)
+          root.each_leaf.flat_map(&:chunk_refs)
+        end
+
+        def normalize_visible_chunks(visible_chunks, root, view)
+          Array(visible_chunks).compact.map do |entry|
+            extract_visible_chunk(entry, root, view)
+          end.compact
+        end
+
+        def extract_visible_chunk(entry, root, view)
+          if entry.is_a?(Hash)
+            key = entry[:key] || entry['key']
+            bounds = entry[:bounds] || entry['bounds']
+            chunk = entry[:chunk] || entry['chunk']
+          elsif entry.is_a?(Array)
+            key, chunk = entry
+            bounds = nil
+          else
+            key = entry
+            bounds = nil
+            chunk = nil
+          end
+
+          bounds ||= chunk_bounds(chunk)
+          bounds ||= bounds_from_index(key, root)
+          bounds ||= bounds_from_visibility(view, key)
+
+          return unless key
+
+          { key: key, bounds: bounds }
+        end
+
+        def bounds_from_index(key, root)
+          return unless key
+
+          node = @index_builder.node_for(key)
+          reference = node&.chunk_refs&.find { |ref| ref[:key] == key }
+          reference && reference[:bounds]
+        end
+
+        def bounds_from_visibility(view, key)
+          return unless view
+          return unless view.respond_to?(:chunk_bounds)
+
+          view.chunk_bounds(key)
+        rescue StandardError
+          nil
+        end
+
+        def chunk_bounds(chunk)
+          chunk&.metadata && chunk.metadata[:bounds]
+        end
+
+        def include_candidate?(cosine, camera_forward, camera_position)
+          return false unless camera_forward && camera_position
+          return false if cosine.nil?
+
+          cosine >= FORWARD_COSINE_THRESHOLD
+        end
+
+        def priority_score(cosine, distance, near_visible)
+          angle_penalty = 1.0 - (cosine || 0.0)
+          distance_penalty = distance || Float::INFINITY
+          score = angle_penalty * ANGLE_WEIGHT + distance_penalty * DISTANCE_WEIGHT
+          near_visible ? score * 0.1 : score
+        end
+
+        def ordered_prefetch_keys(candidates)
+          candidates
+            .sort_by do |candidate|
+              [
+                candidate[:near_visible] ? 0 : 1,
+                candidate[:priority],
+                candidate[:distance]
+              ]
+            end
+            .map { |candidate| candidate[:key] }
+            .uniq
+        end
+
+        def effective_prefetch_limit(budget:, max_prefetch:)
+          limits = []
+          limits << budget if budget.is_a?(Numeric) && budget.positive?
+          limits << max_prefetch if max_prefetch.is_a?(Numeric) && max_prefetch.positive?
+          return nil if limits.empty?
+
+          limits.min
+        end
+
+        def available_prefetch_capacity(precomputed_count = nil)
+          return unless @chunk_store.respond_to?(:max_in_memory)
+          return unless @chunk_store.respond_to?(:each_in_memory)
+
+          max = @chunk_store.max_in_memory
+          return unless max && max.positive?
+
+          in_memory = precomputed_count || @chunk_store.each_in_memory.count
+          remaining = max - in_memory
+          return 0 if remaining <= 0
+
+          remaining
         end
       end
     end
