@@ -97,7 +97,7 @@ module PointCloudPlugin
     path = if defined?(::UI)
              ::UI.openpanel('Import Point Cloud', nil, 'Point Clouds|*.ply;*.xyz||')
            end
-    return unless path
+    return unless path && !path.to_s.empty?
 
     import_defaults = tool.settings_dialog.import_options
 
@@ -119,8 +119,16 @@ module PointCloudPlugin
     FileUtils.mkdir_p(cache_root)
     cache_path = File.join(cache_root, File.basename(path, '.*'))
     chunk_store = Core::ChunkStore.new(cache_path: cache_path)
+    runtime_settings = tool.settings_dialog.settings || {}
+    memory_limit = runtime_settings[:memory_limit]
+    if memory_limit && chunk_store.respond_to?(:memory_limit_mb=)
+      chunk_store.memory_limit_mb = memory_limit
+    end
     pipeline = Core::Lod::Pipeline.new(chunk_store: chunk_store)
     job = Bridge::ImportJob.new(path: path, reader: reader, pipeline: pipeline, queue: manager.queue)
+
+    activate_tool
+    tool.hud.update(load_status: 'Loading point cloud...')
 
     job.instance_variable_set(:@preview_initialized, false)
     job.define_singleton_method(:on_chunk) do |key, chunk, info = {}|
@@ -137,6 +145,12 @@ module PointCloudPlugin
 
     id = manager.register_cloud(name: File.basename(path), pipeline: pipeline, job: job)
     tool.hud.update("cloud_#{id}" => File.basename(path))
+
+    begin
+      apply_runtime_settings(runtime_settings)
+    rescue StandardError => e
+      log("Failed to apply runtime settings: #{e.class}: #{e.message}")
+    end
 
     job.start do
       tool.hud.update(status: 'Import complete')
@@ -162,6 +176,42 @@ module PointCloudPlugin
     tools.push_tool(tool) unless tools.active_tool?(tool)
   rescue NoMethodError
     tools.push_tool(tool)
+  end
+
+  def apply_runtime_settings(settings)
+    return unless settings.is_a?(Hash)
+
+    symbolized = settings.each_with_object({}) do |(key, value), memo|
+      memo[key.to_sym] = value
+    end
+
+    memory_limit = symbolized[:memory_limit]
+    if memory_limit
+      manager.each_cloud do |cloud|
+        store = cloud&.pipeline&.chunk_store
+        next unless store && store.respond_to?(:memory_limit_mb=)
+
+        begin
+          store.memory_limit_mb = memory_limit
+        rescue StandardError => e
+          log("Failed to update memory limit for cloud #{cloud.id}: #{e.message}")
+        end
+      end
+    end
+
+    invalidate_active_view
+  end
+
+  def invalidate_active_view
+    return unless defined?(Sketchup) && Sketchup.respond_to?(:active_model)
+
+    model = Sketchup.active_model
+    view = model&.active_view
+    return unless view && view.respond_to?(:invalidate)
+
+    view.invalidate
+  rescue StandardError => e
+    log("Failed to invalidate view: #{e.message}")
   end
 
   def focus_camera_on_chunk(chunk)
