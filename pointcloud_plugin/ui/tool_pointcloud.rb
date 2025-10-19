@@ -282,7 +282,7 @@ module PointCloudPlugin
           ).each do |key, chunk|
             next unless chunk
 
-            next unless chunk_visible?(chunk, frustum)
+            next unless chunk_visible?(chunk, frustum, view)
 
             break if budget.positive? && points_accumulated >= budget
 
@@ -303,7 +303,7 @@ module PointCloudPlugin
         @active_chunks.each do |key, entry|
           next if visible_keys.include?(key)
 
-          next unless chunk_visible?(entry[:chunk], frustum)
+          next unless chunk_visible?(entry[:chunk], frustum, view)
 
           break if budget.positive? && points_accumulated >= budget
 
@@ -353,11 +353,108 @@ module PointCloudPlugin
         to_coordinates(position)
       end
 
-      def chunk_visible?(chunk, frustum)
+      SCREEN_MARGIN = 32
+
+      def chunk_visible?(chunk, frustum, view)
         bounds = chunk.metadata[:bounds]
         return true unless bounds
 
+        visible = screen_culling_visibility(view, bounds)
+        return visible unless visible.nil?
+
+        return true unless frustum
+
         frustum.intersects_bounds?(bounds)
+      end
+
+      def screen_culling_visibility(view, bounds)
+        return nil unless view&.respond_to?(:screen_coords)
+
+        viewport = viewport_rect(view, SCREEN_MARGIN)
+        return nil unless viewport
+
+        corners = bounds_corners(bounds)
+        return nil unless corners.any?
+
+        corners.any? do |corner|
+          screen_point = view.screen_coords(corner)
+          screen_point_visible?(screen_point, viewport)
+        end
+      rescue StandardError
+        nil
+      end
+
+      def viewport_rect(view, margin)
+        return unless view.respond_to?(:vpwidth) && view.respond_to?(:vpheight)
+
+        width = view.vpwidth
+        height = view.vpheight
+        return nil unless width && height
+
+        {
+          min_x: -margin,
+          max_x: width + margin,
+          min_y: -margin,
+          max_y: height + margin
+        }
+      end
+
+      AXIS_INDEX = { x: 0, y: 1, z: 2 }.freeze
+
+      def screen_point_visible?(screen_point, viewport)
+        return false unless screen_point && viewport
+
+        z = component_from_point(screen_point, :z)
+        return false unless z && z.to_f.positive?
+
+        x = component_from_point(screen_point, :x)
+        y = component_from_point(screen_point, :y)
+        return false unless x && y
+
+        x.between?(viewport[:min_x], viewport[:max_x]) &&
+          y.between?(viewport[:min_y], viewport[:max_y])
+      end
+
+      def bounds_corners(bounds)
+        min_coords = to_coordinates(bounds[:min] || bounds['min'])
+        max_coords = to_coordinates(bounds[:max] || bounds['max'])
+        return [] unless min_coords && max_coords
+
+        xs = [min_coords[0].to_f, max_coords[0].to_f]
+        ys = [min_coords[1].to_f, max_coords[1].to_f]
+        zs = [min_coords[2].to_f, max_coords[2].to_f]
+
+        xs.flat_map do |x|
+          ys.flat_map do |y|
+            zs.map { |z| build_point3d(x, y, z) }
+          end
+        end
+      end
+
+      def build_point3d(x, y, z)
+        if defined?(Geom::Point3d)
+          Geom::Point3d.new(x, y, z)
+        else
+          [x, y, z]
+        end
+      end
+
+      def component_from_point(point, axis)
+        return unless point
+
+        method_name = axis
+        return point.public_send(method_name) if point.respond_to?(method_name)
+
+        index = AXIS_INDEX.fetch(axis)
+
+        if point.is_a?(Array)
+          point[index]
+        elsif point.respond_to?(:to_a)
+          array = point.to_a
+          array[index] if array.length > index
+        elsif point.respond_to?(:[])
+          point[index]
+        end
       end
 
       def extract_matrix(source, *candidates)
